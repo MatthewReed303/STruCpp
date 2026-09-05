@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
@@ -108,6 +109,14 @@ struct Entry {
      */
     uint8_t cap;
 };
+
+// The AVR branches of `read_entry` cannot copy an `Entry` out of PROGMEM as a
+// struct; they read each member by offset. These pin the offsets that
+// arithmetic assumes, on every target, so a member added or reordered here is a
+// compile error rather than an out-of-bounds string access on an ATmega.
+static_assert(offsetof(Entry, ptr) == 0, "Entry::ptr must be first");
+static_assert(offsetof(Entry, tag) == sizeof(void*), "Entry::tag follows ptr");
+static_assert(offsetof(Entry, cap) == sizeof(void*) + 1, "Entry::cap follows tag");
 
 // ---------------------------------------------------------------------------
 // Per-project tables — DECLARED here, DEFINED by generated_debug.cpp.

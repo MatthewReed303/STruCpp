@@ -32,6 +32,11 @@
  * Generic parameters are IEC 61131-3 Ed 3 §6.4.3 "beyond the scope of this
  * standard" for user-declared POUs, so this is a CODESYS-compatible extension,
  * declared as one — the same footing as `__XWORD`, `ADR` and `SIZEOF`.
+ *
+ * A composite is accepted, and the class names the composite: every array is
+ * `TYPE_ARRAY` whatever its elements. A block that has to tell an array of
+ * bits from an array of words wants a typed `ARRAY [*]` VAR_IN_OUT parameter
+ * or a descriptor of its own.
  */
 
 #pragma once
@@ -110,16 +115,27 @@ enum TYPE_CLASS : uint32_t {
  * caller's variable rather than a copy of it — writing `*(T*)any.PVALUE` writes
  * what the caller passed.
  */
+// Zeroed, so an unwired pin reads as nothing. `TYPE_BOOL` is also 0, so it is
+// PVALUE and DISIZE that separate "nothing" from "a BOOL". Without the
+// initialisers a descriptor declared as a function block member held whatever
+// was on the stack, and a block testing `DISIZE > 0` acted on it.
 struct IEC_ANY {
     /** What the argument's declared type was, at the call site. CODESYS
      *  spells this member `typeclass`. */
-    TYPE_CLASS TYPECLASS;
+    TYPE_CLASS TYPECLASS = static_cast<TYPE_CLASS>(0);
     /** The argument's payload storage. Never null for a well-formed call.
      *  CODESYS spells this member `pvalue`. */
-    uint8_t* PVALUE;
-    /** Payload width in bytes: `SIZEOF(INT)` is 2, `SIZEOF(DINT)` is 4.
+    uint8_t* PVALUE = nullptr;
+    /** Payload width in bytes: `SIZEOF(INT)` is 2, `SIZEOF(DINT)` is 4. For an
+     *  array, the elements' combined width packed.
      *  CODESYS spells this member `diSize`. */
-    int32_t DISIZE;
+    int32_t DISIZE = 0;
+    /** Elements, or 1 for anything that is not an array. */
+    int32_t DICOUNT = 0;
+    /** Bytes from one element to the next. Wider than `DISIZE / DICOUNT`,
+     *  because every element carries its forced state beside its value — which
+     *  is why walking an array needs this and not the width. */
+    int32_t DISTRIDE = 0;
 };
 
 /*

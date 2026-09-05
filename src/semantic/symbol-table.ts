@@ -20,6 +20,7 @@ import {
   DECLARABLE_GENERIC_TYPES,
   ELEMENTARY_TYPES,
 } from "./type-utils.js";
+import { IEC_BASE_TYPES } from "./iec-types-data.js";
 
 // =============================================================================
 // Symbol Types
@@ -285,31 +286,17 @@ export class SymbolTables {
    * Initialize built-in IEC types.
    */
   private initializeBuiltinTypes(): void {
+    // Derived from IEC_BASE_TYPES rather than restated, so a type registered
+    // there is declarable here without a second edit. The elementary list used
+    // to be spelled out, which is how LTIME, LTOD and LDT could be registered
+    // and still report "Undefined type".
+    const elementaryNames = IEC_BASE_TYPES.flatMap((t) => [
+      t.name,
+      ...t.aliases,
+    ]);
+
     const builtinTypes = [
-      "BOOL",
-      "BYTE",
-      "WORD",
-      "DWORD",
-      "LWORD",
-      "SINT",
-      "INT",
-      "DINT",
-      "LINT",
-      "USINT",
-      "UINT",
-      "UDINT",
-      "ULINT",
-      "__XWORD",
-      "REAL",
-      "LREAL",
-      "TIME",
-      "DATE",
-      "TIME_OF_DAY",
-      "TOD",
-      "DATE_AND_TIME",
-      "DT",
-      "STRING",
-      "WSTRING",
+      ...elementaryNames,
 
       // CODESYS generic types. Declarable only on a VAR_INPUT of a FUNCTION,
       // FUNCTION_BLOCK or METHOD — `validateGenericTypeUsage` in the analyzer

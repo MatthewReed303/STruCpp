@@ -27,16 +27,21 @@ const errorText = (source: string) =>
     .join("\n");
 
 describe("declaring a generic type", () => {
-  it.each(["ANY", "ANY_BIT", "ANY_DATE", "ANY_NUM", "ANY_REAL", "ANY_INT", "ANY_STRING"])(
-    "accepts %s on a function block VAR_INPUT",
-    (generic) => {
-      const result = compileSource(
-        `FUNCTION_BLOCK F VAR_INPUT P : ${generic}; END_VAR ; END_FUNCTION_BLOCK\n${PROG}`,
-      );
-      expect(result.errors).toEqual([]);
-      expect(result.success).toBe(true);
-    },
-  );
+  it.each([
+    "ANY",
+    "ANY_BIT",
+    "ANY_DATE",
+    "ANY_NUM",
+    "ANY_REAL",
+    "ANY_INT",
+    "ANY_STRING",
+  ])("accepts %s on a function block VAR_INPUT", (generic) => {
+    const result = compileSource(
+      `FUNCTION_BLOCK F VAR_INPUT P : ${generic}; END_VAR ; END_FUNCTION_BLOCK\n${PROG}`,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.success).toBe(true);
+  });
 
   it("accepts one on a FUNCTION and on a METHOD, the other two scopes CODESYS lists", () => {
     expect(
@@ -70,32 +75,44 @@ ${PROG}`;
   });
 
   it("refuses one as a structure field", () => {
-    expect(errorText(`TYPE S : STRUCT F : ANY; END_STRUCT END_TYPE\n${PROG}`)).toContain(
-      "may only be declared on a VAR_INPUT",
-    );
+    expect(
+      errorText(`TYPE S : STRUCT F : ANY; END_STRUCT END_TYPE\n${PROG}`),
+    ).toContain("may only be declared on a VAR_INPUT");
   });
 
   it.each([
-    ["VAR_OUTPUT", "FUNCTION_BLOCK F VAR_OUTPUT P : ANY; END_VAR ; END_FUNCTION_BLOCK"],
-    ["VAR_IN_OUT", "FUNCTION_BLOCK F VAR_IN_OUT P : ANY; END_VAR ; END_FUNCTION_BLOCK"],
+    [
+      "VAR_OUTPUT",
+      "FUNCTION_BLOCK F VAR_OUTPUT P : ANY; END_VAR ; END_FUNCTION_BLOCK",
+    ],
+    [
+      "VAR_IN_OUT",
+      "FUNCTION_BLOCK F VAR_IN_OUT P : ANY; END_VAR ; END_FUNCTION_BLOCK",
+    ],
     ["a local", "FUNCTION_BLOCK F VAR P : ANY; END_VAR ; END_FUNCTION_BLOCK"],
   ])("refuses one on %s", (_label, fb) => {
-    expect(errorText(`${fb}\n${PROG}`)).toContain("may only be declared on a VAR_INPUT");
+    expect(errorText(`${fb}\n${PROG}`)).toContain(
+      "may only be declared on a VAR_INPUT",
+    );
   });
 
   it("refuses one on a PROGRAM, which CODESYS does not list as a scope", () => {
-    expect(errorText("PROGRAM main VAR_INPUT P : ANY; END_VAR ; END_PROGRAM")).toContain(
-      "may only be declared on a VAR_INPUT",
-    );
+    expect(
+      errorText("PROGRAM main VAR_INPUT P : ANY; END_VAR ; END_PROGRAM"),
+    ).toContain("may only be declared on a VAR_INPUT");
   });
 
   it("refuses one as a return type", () => {
     expect(
-      errorText(`FUNCTION F : ANY VAR_INPUT a : INT; END_VAR ; END_FUNCTION\n${PROG}`),
+      errorText(
+        `FUNCTION F : ANY VAR_INPUT a : INT; END_VAR ; END_FUNCTION\n${PROG}`,
+      ),
     ).toContain("may only be declared on a VAR_INPUT");
   });
 
-  it("refuses an array of one — a generic accepts elementary types only", () => {
+  // A variable-length array is VAR_IN_OUT only on a function block, while a
+  // generic is VAR_INPUT only, so ARRAY OF ANY cannot be written at all.
+  it("refuses an array of a generic, which no implementation can offer", () => {
     expect(
       errorText(
         `FUNCTION_BLOCK F VAR_INPUT P : ARRAY[0..3] OF ANY; END_VAR ; END_FUNCTION_BLOCK\n${PROG}`,
@@ -155,15 +172,21 @@ END_PROGRAM`;
     expect(errorText(withBody(body))).toContain("cannot be passed as argument");
   });
 
-  it("refuses a structure — a generic accepts elementary types only", () => {
-    expect(errorText(withBody("a(P := m);"))).toContain("elementary types only");
+  // A structure arrives as TYPE_USERDEF. What the descriptor cannot do is
+  // describe the fields.
+  it("accepts a structure, which arrives as TYPE_USERDEF", () => {
+    const result = compileSource(withBody("a(P := m);"));
+    expect(result.errors).toEqual([]);
+    expect(result.cppCode).toContain("TYPE_CLASS::TYPE_USERDEF");
   });
 
   it.each([
     ["a literal", "a(P := 42);"],
     ["an expression", "a(P := iValue + 1);"],
   ])("refuses %s, which has no address to pass", (_label, body) => {
-    expect(errorText(withBody(body))).toContain("Only a variable may be passed");
+    expect(errorText(withBody(body))).toContain(
+      "Only a variable may be passed",
+    );
   });
 });
 
@@ -229,7 +252,9 @@ END_PROGRAM`;
 
   it("still rejects an unknown member of the __SYSTEM namespace", () => {
     expect(
-      errorText(`FUNCTION_BLOCK F VAR d : __SYSTEM.NoSuchType; END_VAR ; END_FUNCTION_BLOCK\n${PROG}`),
+      errorText(
+        `FUNCTION_BLOCK F VAR d : __SYSTEM.NoSuchType; END_VAR ; END_FUNCTION_BLOCK\n${PROG}`,
+      ),
     ).toContain("Undefined type");
   });
 
@@ -237,7 +262,9 @@ END_PROGRAM`;
     // The qualifier is gated on __SYSTEM, so a stray dot is still the error it
     // always was rather than being parsed as a namespace.
     expect(
-      errorText(`FUNCTION_BLOCK F VAR d : Foo.Bar; END_VAR ; END_FUNCTION_BLOCK\n${PROG}`),
+      errorText(
+        `FUNCTION_BLOCK F VAR d : Foo.Bar; END_VAR ; END_FUNCTION_BLOCK\n${PROG}`,
+      ),
     ).not.toBe("");
   });
 });
@@ -277,7 +304,15 @@ END_PROGRAM`);
     );
   });
 
-  it.each(["ANY", "ANY_BIT", "ANY_DATE", "ANY_NUM", "ANY_REAL", "ANY_INT", "ANY_STRING"])(
+  it.each([
+    "ANY",
+    "ANY_BIT",
+    "ANY_DATE",
+    "ANY_NUM",
+    "ANY_REAL",
+    "ANY_INT",
+    "ANY_STRING",
+  ])(
     "declares a %s parameter as the one runtime descriptor type",
     (generic) => {
       // Every family is an IEC_ANY at the ABI. Left to the generic
@@ -361,7 +396,9 @@ END_PROGRAM`;
     // addresses the caller's array, so the writes have landed; copying back
     // would mean assigning an ArrayView to the concrete array it points at,
     // which is not a conversion that exists.
-    expect(compileSource(SRC).cppCode).not.toContain("READINGS = STATS.VALUES;");
+    expect(compileSource(SRC).cppCode).not.toContain(
+      "READINGS = STATS.VALUES;",
+    );
   });
 
   it("still copies a concrete in-out back", () => {
@@ -498,7 +535,9 @@ END_PROGRAM`;
   });
 
   it("builds the descriptor for a named argument", () => {
-    const result = compileSource(SRC("v : DINT;", "cls := F_CLASS_OF(V := v);"));
+    const result = compileSource(
+      SRC("v : DINT;", "cls := F_CLASS_OF(V := v);"),
+    );
     expect(result.errors).toEqual([]);
     expect(result.cppCode).toContain(
       "F_CLASS_OF(strucpp::IEC_ANY{ strucpp::TYPE_CLASS::TYPE_DINT",
@@ -535,7 +574,9 @@ END_PROGRAM`;
     // `coerceUserFuncArgs` casts an argument to the parameter's type when it
     // widens. `ANY` is not a type to cast to, and `static_cast<IEC_ANY>` would
     // not compile.
-    const cpp = compileSource(SRC("v : SINT;", "cls := F_CLASS_OF(v);")).cppCode;
+    const cpp = compileSource(
+      SRC("v : SINT;", "cls := F_CLASS_OF(v);"),
+    ).cppCode;
     expect(cpp).not.toContain("static_cast<IEC_ANY>");
   });
 });
@@ -679,14 +720,18 @@ END_PROGRAM`;
     expect(result.success).toBe(false);
   });
 
-  it("still refuses a whole array, which has no elementary type", () => {
+  // A whole array reaches the pin as TYPE_ARRAY: the class names the array and
+  // never its elements.
+  it("takes a whole array as TYPE_ARRAY", () => {
     const result = compileBody("a(P := temps);");
-    expect(result.success).toBe(false);
+    expect(result.errors).toEqual([]);
+    expect(result.cppCode).toContain("TYPE_CLASS::TYPE_ARRAY");
   });
 
-  it("still refuses a whole struct", () => {
+  it("takes a whole struct as TYPE_USERDEF", () => {
     const result = compileBody("a(P := m);");
-    expect(result.success).toBe(false);
+    expect(result.errors).toEqual([]);
+    expect(result.cppCode).toContain("TYPE_CLASS::TYPE_USERDEF");
   });
 
   it("builds the descriptor from the ELEMENT, not the array", () => {
@@ -705,4 +750,4 @@ END_PROGRAM`;
     expect(result.cppCode).toContain("TYPE_CLASS::TYPE_INT");
     expect(result.cppCode).toContain("M.RPM.raw_ptr()");
   });
-})
+});

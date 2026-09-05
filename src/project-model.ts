@@ -345,7 +345,7 @@ export interface ProjectModelResult {
  * throwing, mirroring `parseTimeLiteral`.
  */
 export function parseDateLiteralToDays(literal: string): bigint {
-  const stripped = literal.replace(/^(D|DATE)#/i, "");
+  const stripped = literal.replace(/^(LDATE|LD|DATE|D)#/i, "");
   const m = stripped.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (!m) return 0n;
   const MS_PER_DAY = 86_400_000n;
@@ -362,7 +362,10 @@ export function parseDateLiteralToDays(literal: string): bigint {
  * rounding mode). Returns 0 for unparsable input.
  */
 export function parseTodLiteralToNs(literal: string): bigint {
-  const stripped = literal.replace(/^(TOD|TIME_OF_DAY)#/i, "");
+  const stripped = literal.replace(
+    /^(LTIME_OF_DAY|LTOD|TIME_OF_DAY|TOD)#/i,
+    "",
+  );
   const m = stripped.match(/^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?$/);
   if (!m) return 0n;
   const hh = m[1] ?? "0";
@@ -387,7 +390,10 @@ export function parseTodLiteralToNs(literal: string): bigint {
  * Returns 0 for unparsable input.
  */
 export function parseDtLiteralToNs(literal: string): bigint {
-  const stripped = literal.replace(/^(DT|DATE_AND_TIME)#/i, "");
+  const stripped = literal.replace(
+    /^(LDATE_AND_TIME|LDT|DATE_AND_TIME|DT)#/i,
+    "",
+  );
   const m = stripped.match(
     /^(\d{4})-(\d{1,2})-(\d{1,2})-(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?$/,
   );
@@ -415,8 +421,9 @@ export function parseTimeLiteral(literal: string): TimeValue {
   const rawValue = literal;
   let nanoseconds = 0;
 
-  // Remove T# or TIME# prefix (case insensitive)
-  let value = literal.replace(/^(T|TIME)#/i, "");
+  // Remove the duration prefix (case insensitive): T, LT, TIME or LTIME.
+  // LTIME shares TIME's nanosecond representation, so both parse the same.
+  let value = literal.replace(/^(LTIME|LT|TIME|T)#/i, "");
 
   // Parse components: d (days), h (hours), m (minutes), s (seconds), ms (milliseconds), us (microseconds), ns (nanoseconds)
   const patterns = [
@@ -952,7 +959,7 @@ export class ProjectModelBuilder {
       // Handle raw string that might be a time literal
       if (
         typeof lit.rawValue === "string" &&
-        lit.rawValue.match(/^T#|^TIME#/i)
+        lit.rawValue.match(/^(LTIME|LT|TIME|T)#/i)
       ) {
         return parseTimeLiteral(lit.rawValue);
       }

@@ -38,7 +38,8 @@
  * read() returns the real IEC value type, so generated bodies and constrained
  * std-lib templates (NOT, ADD, …) deduce the operand correctly — the wrapper is
  * never the deduced operand. Forcing is preserved via the canonical's
- * get()/set(); located globals additionally honor the image forced-slot bitmap.
+ * get()/set(), which is the whole of it — there is no separate forced-slot
+ * bitmap in this runtime.
  */
 #ifndef STRUCPP_IEC_GLOBAL_HPP
 #define STRUCPP_IEC_GLOBAL_HPP

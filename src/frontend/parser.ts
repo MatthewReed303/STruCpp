@@ -1821,8 +1821,10 @@ export class STParser extends CstParser {
             this.OR3({
               DEF: [
                 { ALT: () => this.SUBRULE2(this.identifierOrKeyword) },
-                // Bit access: var.0, var.31
+                // Bit access: var.0, var.31 — `%X` is optional for bits.
                 { ALT: () => this.CONSUME(tokens.IntegerLiteral) },
+                // Partial access: var.%X15, var.%B3, var.%W1, var.%D0
+                { ALT: () => this.CONSUME(tokens.PartialAccess) },
               ],
               IGNORE_AMBIGUITIES: true,
             });

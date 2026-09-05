@@ -95,7 +95,9 @@ const IEC_NAME_TO_TAG: Record<string, TagName> = {
   TIME: "TIME",
   LTIME: "TIME",
   DATE: "DATE",
-  LDATE: "DATE",
+  // LDATE is deliberately absent: it wants nanoseconds where DATE_t holds
+  // whole days, so tagging it as DATE would misreport every value by 86400e9.
+  // Unsupported until it has its own representation.
   TOD: "TOD",
   TIME_OF_DAY: "TOD",
   LTOD: "TOD",

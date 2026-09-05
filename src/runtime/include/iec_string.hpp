@@ -359,10 +359,22 @@ public:
     IECStringVar() noexcept : value_{}, forced_{false}, forced_value_{} {}
     IECStringVar(const value_type& v) noexcept : value_{v}, forced_{false}, forced_value_{} {}
     IECStringVar(const char* str) noexcept : value_{str}, forced_{false}, forced_value_{} {}
-    IECStringVar(const IECStringVar&) = default;
-    IECStringVar(IECStringVar&&) = default;
-    IECStringVar& operator=(const IECStringVar&) = default;
-    IECStringVar& operator=(IECStringVar&&) = default;
+    // Same contract as IECVar: a fresh instance starts unforced, and assigning
+    // FROM another goes through set() so the destination's force survives. A
+    // memberwise copy would carry the source's force state across and silently
+    // unforce what the debugger is holding, every scan cycle.
+    IECStringVar(const IECStringVar& other) noexcept
+        : value_{other.get()}, forced_{false}, forced_value_{} {}
+    IECStringVar(IECStringVar&& other) noexcept
+        : value_{other.get()}, forced_{false}, forced_value_{} {}
+    IECStringVar& operator=(const IECStringVar& other) noexcept {
+        set(other.get());
+        return *this;
+    }
+    IECStringVar& operator=(IECStringVar&& other) noexcept {
+        set(other.get());
+        return *this;
+    }
 
     // Cross-size converting constructor (IEC 61131-3: STRING types are interoperable)
     template<size_t OtherLen, std::enable_if_t<OtherLen != MaxLen, int> = 0>
@@ -382,21 +394,21 @@ public:
     // Cross-size assignment (IEC 61131-3: STRING types are interoperable, truncation on overflow)
     template<size_t OtherLen>
     IECStringVar& operator=(const IECStringVar<OtherLen>& other) noexcept {
-        value_ = IECString<MaxLen>(other.get().c_str());
+        set(IECString<MaxLen>(other.get().c_str()));
         return *this;
     }
 
     // Assignment from IECVar<IECString<N>> (struct field access)
     template<size_t OtherLen>
     IECStringVar& operator=(const IECVar<IECString<OtherLen>>& other) noexcept {
-        value_ = IECString<MaxLen>(static_cast<IECString<OtherLen>>(other).c_str());
+        set(IECString<MaxLen>(static_cast<IECString<OtherLen>>(other).c_str()));
         return *this;
     }
 
     // Assignment from IECString of different size
     template<size_t OtherLen, std::enable_if_t<OtherLen != MaxLen, int> = 0>
     IECStringVar& operator=(const IECString<OtherLen>& other) noexcept {
-        value_ = IECString<MaxLen>(other.c_str());
+        set(IECString<MaxLen>(other.c_str()));
         return *this;
     }
 
@@ -404,12 +416,16 @@ public:
         return forced_ ? forced_value_ : value_;
     }
 
+    // Ignored while forced. debug_dispatch.hpp's write_string relies on this
+    // guard by name, and without it ordinary ST (`s := 'x'`) overwrote the raw
+    // slot that read_string reports, so the debugger and the program disagreed
+    // about a forced string.
     void set(const value_type& v) noexcept {
-        value_ = v;
+        if (!forced_) { value_ = v; }
     }
 
     void set(const char* str) noexcept {
-        value_ = str;
+        if (!forced_) { value_ = str; }
     }
 
     value_type get_underlying() const noexcept {

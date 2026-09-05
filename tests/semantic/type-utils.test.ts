@@ -38,10 +38,28 @@ function parseAST(source: string) {
 
 describe("type-utils", () => {
   describe("ELEMENTARY_TYPES", () => {
-    it("should define all 24 types (22 canonical + TOD + DT aliases)", () => {
-      // 22 canonical = 21 standard elementary types + __XWORD (platform-width
-      // address type); plus the TOD and DT alias entries.
-      expect(Object.keys(ELEMENTARY_TYPES)).toHaveLength(24);
+    it("should define all 29 types (25 canonical + 4 aliases)", () => {
+      // 25 canonical = 21 standard elementary types, __XWORD (platform-width
+      // address type), and the three long time types LTIME, LTOD and LDT.
+      // LDATE is deliberately absent: it needs nanoseconds where DATE_t holds
+      // whole days.
+      //
+      // 4 aliases = TOD/TIME_OF_DAY, DT/DATE_AND_TIME, and the long forms
+      // LTOD/LTIME_OF_DAY, LDT/LDATE_AND_TIME.
+      expect(Object.keys(ELEMENTARY_TYPES)).toHaveLength(29);
+    });
+
+    it.each(["LTIME", "LTOD", "LDT", "LTIME_OF_DAY", "LDATE_AND_TIME"])(
+      "defines %s as a 64-bit type",
+      (name) => {
+        expect(ELEMENTARY_TYPES[name]?.sizeBits).toBe(64);
+      },
+    );
+
+    it("does not define LDATE — its unit does not match DATE_t", () => {
+      // LDATE counts nanoseconds since 1970-01-01, while DATE_t holds whole
+      // days, so it cannot share DATE's representation.
+      expect(ELEMENTARY_TYPES["LDATE"]).toBeUndefined();
     });
 
     it("should have correct sizes for integer types", () => {

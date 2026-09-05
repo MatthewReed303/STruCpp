@@ -124,39 +124,67 @@ public:
     IEC_ENUM_Var(value_type val) noexcept
         : value_{val}, forced_{false}, forced_value_{} {}
     
-    IEC_ENUM_Var(const IEC_ENUM_Var&) = default;
-    IEC_ENUM_Var(IEC_ENUM_Var&&) = default;
-    IEC_ENUM_Var& operator=(const IEC_ENUM_Var&) = default;
-    IEC_ENUM_Var& operator=(IEC_ENUM_Var&&) = default;
+    // Same contract as IECVar, which debug_dispatch.hpp's force_impl/read_impl
+    // reach this class through: a fresh instance starts unforced, and assigning
+    // FROM another goes through set() so the destination's force survives. A
+    // memberwise copy would carry the source's force state across and silently
+    // unforce what the debugger is holding, every scan cycle.
+    IEC_ENUM_Var(const IEC_ENUM_Var& other) noexcept
+        : value_{other.get()}, forced_{false}, forced_value_{} {}
+    IEC_ENUM_Var(IEC_ENUM_Var&& other) noexcept
+        : value_{other.get()}, forced_{false}, forced_value_{} {}
+    IEC_ENUM_Var& operator=(const IEC_ENUM_Var& other) noexcept {
+        set(other.get());
+        return *this;
+    }
+    IEC_ENUM_Var& operator=(IEC_ENUM_Var&& other) noexcept {
+        set(other.get());
+        return *this;
+    }
     
     // Get current value (returns forced value if forced)
     value_type get() const noexcept {
         return forced_ ? forced_value_ : value_;
     }
     
-    // Set value (ignored if forced)
+    // Ignored while forced, so a force stays authoritative against the
+    // program's own writes — the same guard IECVar::set carries.
     void set(value_type v) noexcept {
-        value_ = v;
+        if (!forced_) { value_ = v; }
     }
     
     void set(EnumType v) noexcept {
-        value_ = v;
+        if (!forced_) { value_ = v; }
     }
     
+    /**
+     * The payload, for a reader outside the class.
+     *
+     * Same contract as `IECVar::raw_ptr()`: `force()` mirrors into the raw
+     * slot, so what this addresses is the forced value while a force stands.
+     * A generic argument's descriptor is filled from here.
+     */
+    value_type* raw_ptr() noexcept { return &value_; }
+    const value_type* raw_ptr() const noexcept { return &value_; }
+
     // Get underlying value (ignoring forcing)
     value_type get_underlying() const noexcept {
         return value_;
     }
     
-    // Force to a specific value
+    // The raw value follows the force, so external readers reaching the
+    // storage directly — a driver, or an ANY descriptor's pvalue — see the
+    // forced value too. IECVar::force does the same.
     void force(value_type v) noexcept {
         forced_ = true;
         forced_value_ = v;
+        value_ = v;
     }
     
     void force(EnumType v) noexcept {
         forced_ = true;
         forced_value_ = v;
+        value_ = v;
     }
     
     // Remove forcing
@@ -273,5 +301,22 @@ inline std::ostream& operator<<(std::ostream& os, const IEC_ENUM_Var<EnumType>& 
  *   using Status_Value = IEC_ENUM_Value<Status>;
  *   using Status_Var = IEC_ENUM_Var<Status>;
  */
+
+
+/**
+ * `SIZEOF` on an enumeration — the value, not the wrapper.
+ *
+ * Without this it falls to the generic `IEC_SIZEOF(const T&)` and reports the
+ * whole wrapper, forced state included — twelve bytes rather than the width of
+ * the enumeration's own base type. Same shape as the STRING and
+ * variable-length-array overloads, and for the same reason.
+ *
+ * Declared here rather than beside those: `iec_std_lib.hpp` includes this
+ * header, so the dependency only runs one way.
+ */
+template <typename EnumType>
+inline uint32_t IEC_SIZEOF(const IEC_ENUM_Var<EnumType>&) noexcept {
+    return static_cast<uint32_t>(sizeof(IEC_ENUM_Value<EnumType>));
+}
 
 }  // namespace strucpp

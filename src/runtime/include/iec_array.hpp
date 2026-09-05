@@ -135,6 +135,18 @@ public:
     
     // Size information
     static constexpr size_t length() noexcept { return size; }
+
+    /**
+     * The elements in memory order, and how many.
+     *
+     * What a generic argument's descriptor is built from: the address of the
+     * first element whatever the declared lower bound, and a count that does
+     * not depend on the rank. Bounds-checked access is `at()`; this is for
+     * describing the storage, not reaching into it.
+     */
+    element_type* elements() noexcept { return data_.data(); }
+    const element_type* elements() const noexcept { return data_.data(); }
+    static constexpr size_t element_count() noexcept { return size; }
     static constexpr int64_t lower_bound(int = 1) noexcept { return Bounds::lower; }
     static constexpr int64_t upper_bound(int = 1) noexcept { return Bounds::upper; }
     
@@ -250,6 +262,18 @@ public:
     auto end() noexcept { return data_.end(); }
     auto begin() const noexcept { return data_.begin(); }
     auto end() const noexcept { return data_.end(); }
+
+    /**
+     * The elements in memory order, and how many.
+     *
+     * What a generic argument's descriptor is built from: the address of the
+     * first element whatever the declared lower bound, and a count that does
+     * not depend on the rank. Bounds-checked access is `at()`; this is for
+     * describing the storage, not reaching into it.
+     */
+    element_type* elements() noexcept { return data_.data(); }
+    const element_type* elements() const noexcept { return data_.data(); }
+    static constexpr size_t element_count() noexcept { return total_size; }
 };
 
 // Multi-dimensional array (3D)
@@ -376,6 +400,18 @@ public:
     auto end() noexcept { return data_.end(); }
     auto begin() const noexcept { return data_.begin(); }
     auto end() const noexcept { return data_.end(); }
+
+    /**
+     * The elements in memory order, and how many.
+     *
+     * What a generic argument's descriptor is built from: the address of the
+     * first element whatever the declared lower bound, and a count that does
+     * not depend on the rank. Bounds-checked access is `at()`; this is for
+     * describing the storage, not reaching into it.
+     */
+    element_type* elements() noexcept { return data_.data(); }
+    const element_type* elements() const noexcept { return data_.data(); }
+    static constexpr size_t element_count() noexcept { return total_size; }
 };
 
 // Convenience type aliases
@@ -522,5 +558,33 @@ public:
     int64_t lower_bound(int dim) const noexcept { return dim == 1 ? lower1_ : lower2_; }
     int64_t upper_bound(int dim) const noexcept { return dim == 1 ? upper1_ : upper2_; }
 };
+
+/**
+ * `SIZEOF` on a variable-length array parameter — the data, not the view.
+ *
+ * A view is a descriptor (pointer plus bounds) of a size that has nothing to
+ * do with what it addresses, so without these it falls to the generic
+ * `IEC_SIZEOF(const T&)` and reports `sizeof(ArrayView1D<T>)` — the same
+ * number for every element type and every length.
+ *
+ * The count comes from the bounds the caller passed, so this reports what a
+ * fixed-bound array of the same shape reports: the physical footprint, which
+ * is what `MEMCPY` needs and what `SIZEOF` on a whole array already gives.
+ * That also makes `SIZEOF(a) / count` the element stride on any target,
+ * without a table of types and sizes to keep in sync.
+ */
+template <typename T>
+inline uint32_t IEC_SIZEOF(const ArrayView1D<T>& v) noexcept {
+    const int64_t n = v.length();
+    return static_cast<uint32_t>((n > 0 ? n : 0) * static_cast<int64_t>(sizeof(T)));
+}
+
+template <typename T>
+inline uint32_t IEC_SIZEOF(const ArrayView2D<T>& v) noexcept {
+    const int64_t d1 = v.upper_bound(1) - v.lower_bound(1) + 1;
+    const int64_t d2 = v.upper_bound(2) - v.lower_bound(2) + 1;
+    const int64_t n = (d1 > 0 && d2 > 0) ? d1 * d2 : 0;
+    return static_cast<uint32_t>(n * static_cast<int64_t>(sizeof(T)));
+}
 
 }  // namespace strucpp

@@ -37,19 +37,22 @@ import { Scope, SymbolTables } from "./symbol-table.js";
 import type { FunctionSymbol } from "./symbol-table.js";
 import { TypeChecker } from "./type-checker.js";
 import {
-  TYPE_CATEGORIES,
   arrayDimSize,
+  arrayElementTypeName,
   arrayTotalSize,
   buildEnumMemberMap,
   describeType,
   getBitAccessWidth,
   isDeclarableGenericType,
+  isStandardPartialAccessType,
+  parsePartialAccess,
   resolveArrayElementType,
   resolveArrayShape,
   resolveArrayShapeByName,
   resolveFieldType,
   type ArrayShape,
   type EnumMemberEntry,
+  TYPE_CATEGORIES,
 } from "./type-utils.js";
 import {
   isEnArgument,
@@ -212,6 +215,13 @@ interface UndeclaredVarContext {
   propertyName?: string;
 }
 
+/** How a partial access reads in a diagnostic: "Bit", "Byte", "Word", "Dword". */
+function partLabel(part: { resultType: string }): string {
+  return part.resultType === "BOOL"
+    ? "Bit"
+    : part.resultType.charAt(0) + part.resultType.slice(1).toLowerCase();
+}
+
 export class SemanticAnalyzer {
   private symbolTables: SymbolTables;
   private typeChecker: TypeChecker;
@@ -279,6 +289,32 @@ export class SemanticAnalyzer {
     return typeSymbol?.kind === "type" && typeSymbol.resolvedType
       ? (typeSymbol.resolvedType as EnumType | ElementaryType)
       : { typeKind: "elementary" as const, name: typeName, sizeBits: 0 };
+  }
+
+  /**
+   * Which generic families an argument's type may be passed to. An array takes
+   * its element's families, so `ARRAY OF DINT` reaches an `ANY_INT` pin and
+   * `ARRAY OF REAL` does not. Undefined when a generic accepts it at all.
+   */
+  private genericCategoriesFor(
+    typeName: string,
+  ): readonly string[] | undefined {
+    const upper = typeName.toUpperCase();
+    const direct = TYPE_CATEGORIES[upper];
+    if (direct) return direct;
+
+    const element = arrayElementTypeName(upper);
+    if (element) {
+      const inner = TYPE_CATEGORIES[element];
+      return inner
+        ? [...inner, "ANY_DERIVED"]
+        : this.isKnownType(element)
+          ? ["ANY", "ANY_DERIVED"]
+          : undefined;
+    }
+
+    // A declared structure or enumeration.
+    return this.isKnownType(upper) ? ["ANY", "ANY_DERIVED"] : undefined;
   }
 
   /**
@@ -2209,10 +2245,13 @@ export class SemanticAnalyzer {
           : varTypeMap.get(arg.value.name.toUpperCase());
       if (!argType) continue;
 
-      const categories = TYPE_CATEGORIES[argType.toUpperCase()];
+      // A composite is accepted, and the class names the composite: an array
+      // arrives as TYPE_ARRAY, a structure TYPE_USERDEF, an enumeration
+      // TYPE_ENUM.
+      const categories = this.genericCategoriesFor(argType);
       if (!categories) {
         this.addError(
-          `Type '${argType}' cannot be passed as ${where}: a generic parameter accepts elementary types only`,
+          `Type '${argType}' cannot be passed as ${where}: a generic parameter takes an elementary type, an array, a structure or an enumeration`,
           expr.sourceSpan.startLine,
           expr.sourceSpan.startCol,
           expr.sourceSpan.file,
@@ -2220,7 +2259,7 @@ export class SemanticAnalyzer {
         continue;
       }
 
-      if (!(categories as readonly string[]).includes(generic)) {
+      if (!categories.includes(generic)) {
         this.addError(
           `Type '${argType}' cannot be passed as ${where}, declared '${generic}'`,
           expr.sourceSpan.startLine,
@@ -2425,12 +2464,12 @@ export class SemanticAnalyzer {
   ): void {
     if (expr.fieldAccess.length === 0) return;
 
-    // Find the first numeric field access (bit index)
+    // Find the first partial access — a bare bit index (`var.31`) or a sized
+    // part (`var.%B3`).
     for (let i = 0; i < expr.fieldAccess.length; i++) {
       const field = expr.fieldAccess[i]!;
-      if (!/^\d+$/.test(field)) continue;
-
-      const bitIndex = parseInt(field, 10);
+      const part = parsePartialAccess(field);
+      if (!part) continue;
 
       // Resolve the type of the field chain up to (but not including) the bit index
       let typeName = varTypeMap.get(expr.name.toUpperCase());
@@ -2449,7 +2488,8 @@ export class SemanticAnalyzer {
       // Walk intermediate fields to resolve the type
       for (let j = 0; j < i; j++) {
         const intermediateField = expr.fieldAccess[j]!;
-        if (/^\d+$/.test(intermediateField)) return; // Earlier bit access — skip
+        // An earlier partial access — nothing further can be resolved from it.
+        if (parsePartialAccess(intermediateField)) return;
         typeName = resolveFieldType(typeName, intermediateField, ast);
         if (!typeName) return;
       }
@@ -2457,24 +2497,51 @@ export class SemanticAnalyzer {
       const typeUpper = typeName.toUpperCase();
       const bits = getBitAccessWidth(typeUpper);
       if (bits === undefined) {
-        // Type doesn't support bit access (REAL, STRING, user-defined, etc.)
+        // Type doesn't support partial access (REAL, STRING, user-defined, …).
         this.addError(
-          `Bit access is not valid on type ${typeName}`,
+          `${partLabel(part)} access is not valid on type ${typeName}`,
           expr.sourceSpan.startLine,
           expr.sourceSpan.startCol,
           expr.sourceSpan.file,
         );
         return;
       }
-      if (bitIndex >= bits) {
+
+      // A part exists only where it is strictly narrower than the variable: a
+      // WORD has bytes and bits but no words, and nothing has a part as wide
+      // as itself. The count of parts follows from the widths.
+      const parts = Math.floor(bits / part.widthBits);
+      if (parts <= 1) {
         this.addError(
-          `Bit index ${bitIndex} is out of range for type ${typeName} (0..${bits - 1})`,
+          `${partLabel(part)} access is not valid on type ${typeName}, which is ${bits} bits wide`,
+          expr.sourceSpan.startLine,
+          expr.sourceSpan.startCol,
+          expr.sourceSpan.file,
+        );
+        return;
+      }
+      if (part.index >= parts) {
+        this.addError(
+          `${partLabel(part)} index ${part.index} is out of range for type ${typeName} (0..${parts - 1})`,
+          expr.sourceSpan.startLine,
+          expr.sourceSpan.startCol,
+          expr.sourceSpan.file,
+        );
+        return;
+      }
+
+      // Well formed, but on an integer rather than a bit-field type: accepted,
+      // and reported. After the bounds checks, so a malformed access gets one
+      // clear error rather than an error and an aside.
+      if (!isStandardPartialAccessType(typeUpper)) {
+        this.addWarning(
+          `Partial access on type ${typeName} is an extension — the standard set is BYTE, WORD, DWORD and LWORD`,
           expr.sourceSpan.startLine,
           expr.sourceSpan.startCol,
           expr.sourceSpan.file,
         );
       }
-      return; // Only check the first bit access
+      return; // Only check the first partial access
     }
   }
 
@@ -2970,8 +3037,10 @@ export class SemanticAnalyzer {
     // all reach here through call sites that pass nothing — and VAR_INPUT opts
     // in.
     //
-    // An array of a generic is refused everywhere: only elementary types may be
-    // the argument, so there is nothing an ARRAY OF ANY could be passed.
+    // ARRAY [*] OF ANY cannot be written at all: a variable-length array is
+    // VAR_IN_OUT only on a function block, while a generic is VAR_INPUT only.
+    // A fixed-length ARRAY OF ANY is refused on the same grounds as any
+    // composite — see checkGenericArgs.
     if (isDeclarableGenericType(nameToCheck)) {
       const asArrayElement = typeRef.elementTypeName !== undefined;
       if (!genericsPermitted || asArrayElement) {

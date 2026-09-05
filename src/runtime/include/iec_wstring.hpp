@@ -372,15 +372,25 @@ public:
     IECWStringVar() noexcept : value_{}, forced_{false}, forced_value_{} {}
     IECWStringVar(const value_type& v) noexcept : value_{v}, forced_{false}, forced_value_{} {}
     IECWStringVar(const char16_t* str) noexcept : value_{str}, forced_{false}, forced_value_{} {}
-    IECWStringVar(const IECWStringVar&) = default;
-    IECWStringVar(IECWStringVar&&) = default;
-    IECWStringVar& operator=(const IECWStringVar&) = default;
-    IECWStringVar& operator=(IECWStringVar&&) = default;
+    // Same contract as IECVar: a fresh instance starts unforced, and assigning
+    // FROM another goes through set() so the destination's force survives.
+    IECWStringVar(const IECWStringVar& other) noexcept
+        : value_{other.get()}, forced_{false}, forced_value_{} {}
+    IECWStringVar(IECWStringVar&& other) noexcept
+        : value_{other.get()}, forced_{false}, forced_value_{} {}
+    IECWStringVar& operator=(const IECWStringVar& other) noexcept {
+        set(other.get());
+        return *this;
+    }
+    IECWStringVar& operator=(IECWStringVar&& other) noexcept {
+        set(other.get());
+        return *this;
+    }
 
     // Cross-size assignment (IEC 61131-3: WSTRING types are interoperable, truncation on overflow)
     template<size_t OtherLen>
     IECWStringVar& operator=(const IECWStringVar<OtherLen>& other) noexcept {
-        value_ = IECWString<MaxLen>(other.get().c_str());
+        set(IECWString<MaxLen>(other.get().c_str()));
         return *this;
     }
 
@@ -388,12 +398,13 @@ public:
         return forced_ ? forced_value_ : value_;
     }
 
+    // Ignored while forced, mirroring IECStringVar and IECVar.
     void set(const value_type& v) noexcept {
-        value_ = v;
+        if (!forced_) { value_ = v; }
     }
 
     void set(const char16_t* str) noexcept {
-        value_ = str;
+        if (!forced_) { value_ = str; }
     }
 
     value_type get_underlying() const noexcept {

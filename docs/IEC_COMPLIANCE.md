@@ -15,7 +15,8 @@ STruC++ implements the Structured Text (ST) language from IEC 61131-3. This docu
 | DATE | Supported | |
 | TIME_OF_DAY | Supported | |
 | DATE_AND_TIME | Supported | |
-| LTIME, LDATE, LTOD, LDT | Supported | 64-bit time types with nanosecond precision |
+| LTIME, LTOD, LDT | Supported | 64-bit nanoseconds, sharing TIME/TOD/DT storage. Literals `LT#`, `LTIME#`, `LTOD#`, `LDT#`; implicit TIME→LTIME, TOD→LTOD, DT→LDT |
+| LDATE | Not implemented | Needs nanoseconds; DATE stores whole days, so it cannot share DATE's representation |
 | STRING | Supported | Parameterized length: STRING(N), default 254 |
 | WSTRING | Supported | Parameterized length: WSTRING(N) |
 | CHAR, WCHAR | Supported | |
@@ -98,6 +99,7 @@ STruC++ implements the Structured Text (ST) language from IEC 61131-3. This docu
 | Method call | `obj.method(args)` | Supported |
 | Array access | `arr[i]`, `arr[i, j]` | Supported — the index count is validated against the declared rank |
 | Field access | `struct.field` | Supported |
+| Partial access | `var.0`, `var.%X0`, `var.%B1`, `var.%W0`, `var.%D1` | Supported — read and write. Also accepted on the integer types, which warns, as CODESYS's SA0148 does |
 | Typed literals | `INT#5`, `DINT#42`, `REAL#3.14` | Supported |
 | Integer literals | `9223372036854775807`, `16#FF`, `1_000` | Supported — the full 64-bit LINT/ULINT range is preserved exactly; a value wider than ULINT is rejected |
 | NEW | `__NEW(type)`, `__NEW(type, size)` | Supported |
@@ -185,6 +187,7 @@ Bundled as a compiled `.stlib` library (`libs/iec-standard-fb.stlib`):
 | Dynamic memory | Supported | `__NEW(type)`, `__DELETE(ptr)` |
 | POINTER TO | Supported | Full pointer type with dereference |
 | Typed literals | Supported | `INT#5`, `DINT#42`, `REAL#3.14` |
+| Generic parameters | Supported | `ANY`, `ANY_INT`, … on input pins; elementary types only. Descriptor type `__SYSTEM.AnyType`, usable as an array element to carry arguments of mixed type |
 
 ## Not Yet Implemented
 
@@ -193,7 +196,6 @@ Bundled as a compiled `.stlib` library (`libs/iec-standard-fb.stlib`):
 | UNION | CODESYS union type |
 | FB_Init / FB_Exit | Constructor/destructor lifecycle methods |
 | __QUERYINTERFACE | Runtime interface query |
-| Bit access (var.%X0) | Individual bit addressing |
 | ACTION blocks | Named action blocks |
 | TRY/CATCH/FINALLY | Exception handling |
 | Generics | Parameterized types |

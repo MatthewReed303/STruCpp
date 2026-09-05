@@ -176,8 +176,8 @@ inline void read_string(const void* p, uint8_t* dest, uint8_t cap) noexcept {
 
 inline void write_string(void* p, const uint8_t* bytes, uint8_t cap) noexcept {
     const auto view = iec_string_view(p, debug_capacity(cap));
-    // A no-op while forced, matching `IECStringVar::set`'s own guard: a debugger
-    // force stays authoritative until it is explicitly lifted.
+    // A no-op while forced, matching `IECStringVar::set`, which carries the same
+    // guard: a debugger force stays authoritative until it is explicitly lifted.
     if (*view.forced) return;
     const uint8_t wire_len = bytes[0] < DEBUG_STRING_CAP ? bytes[0] : DEBUG_STRING_CAP;
     iec_string_store(view.data, view.length, view.capacity,
@@ -354,6 +354,10 @@ inline Entry read_entry(uint8_t arr, uint16_t elem) noexcept {
     uint8_t tag_val   = pgm_read_byte(entry_addr + sizeof(void*));
     out.ptr = reinterpret_cast<void*>(ptr_val);
     out.tag = tag_val;
+    // `cap` is the third member, one byte past the tag. Without it every
+    // sized STRING reads as the 254 default and the string ops compute their
+    // forced-value offsets past the end of the object.
+    out.cap = pgm_read_byte(entry_addr + sizeof(void*) + 1);
 #elif defined(__AVR__)
     // AVR without RAMPZ — flash is ≤64 KB on these chips, so every PROGMEM
     // address fits in a 16-bit pointer and near accessors are sufficient.
@@ -366,6 +370,10 @@ inline Entry read_entry(uint8_t arr, uint16_t elem) noexcept {
     uint8_t tag_val   = pgm_read_byte(entry_addr + sizeof(void*));
     out.ptr = reinterpret_cast<void*>(ptr_val);
     out.tag = tag_val;
+    // `cap` is the third member, one byte past the tag. Without it every
+    // sized STRING reads as the 254 default and the string ops compute their
+    // forced-value offsets past the end of the object.
+    out.cap = pgm_read_byte(entry_addr + sizeof(void*) + 1);
 #else
     uint16_t count = debug_array_counts[arr];
     if (elem >= count) return out;
@@ -386,7 +394,8 @@ inline uint8_t handle_set(uint8_t arr, uint16_t elem, bool forcing,
 
     if (forcing) {
         uint8_t expected = type_ops[e.tag].size;
-        // size == 0 is the string stub — Phase 4a rejects for now
+        // A tag with no width has no ops to dispatch to. STRING and WSTRING
+        // carry real widths (127 / 253), so this no longer excludes them.
         if (expected == 0) return STATUS_DATA_TOO_LARGE;
         if (len < expected) return STATUS_DATA_TOO_LARGE;
         type_ops[e.tag].force(e.ptr, bytes, e.cap);
@@ -402,7 +411,7 @@ inline uint16_t handle_read(uint8_t arr, uint16_t elem, uint8_t* dest) noexcept 
     Entry e = read_entry(arr, elem);
     if (!e.ptr || e.tag >= TAG__COUNT) return 0;
     uint8_t n = type_ops[e.tag].size;
-    if (n == 0) return 0;  // string stub
+    if (n == 0) return 0;  // tag with no width
     type_ops[e.tag].read(e.ptr, dest, e.cap);
     return n;
 }
@@ -418,7 +427,7 @@ inline uint8_t handle_write(uint8_t arr, uint16_t elem,
     Entry e = read_entry(arr, elem);
     if (!e.ptr || e.tag >= TAG__COUNT) return STATUS_OUT_OF_BOUNDS;
     uint8_t expected = type_ops[e.tag].size;
-    if (expected == 0) return STATUS_DATA_TOO_LARGE;  // string stub
+    if (expected == 0) return STATUS_DATA_TOO_LARGE;  // tag with no width
     if (len < expected) return STATUS_DATA_TOO_LARGE;
     type_ops[e.tag].write(e.ptr, bytes, e.cap);
     return STATUS_OK;

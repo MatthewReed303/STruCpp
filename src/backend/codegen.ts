@@ -64,16 +64,19 @@ import {
 } from "./codegen-utils.js";
 import { mangledMemberName, needsMemberMangling } from "./member-mangling.js";
 import {
-  TYPE_CLASS_BY_IEC_TYPE,
+  arrayElementTypeName,
   buildEnumMemberMap,
   getTypeBits,
   getTypeCategory,
   isAnyDescriptorType,
   isDeclarableGenericType,
   isImplicitlyConvertible,
+  parsePartialAccess,
   resolveArrayElementType as resolveArrayElementTypeUtil,
   resolveFieldType as resolveFieldTypeUtil,
   type EnumMemberEntry,
+  type PartialAccess,
+  TYPE_CLASS_BY_IEC_TYPE,
   typeName as typeNameUtil,
 } from "../semantic/type-utils.js";
 import {
@@ -926,6 +929,48 @@ export class CodeGenerator {
       );
       if (archive.manifest.types) {
         this.registerLibraryTypes(archive.manifest.types);
+      }
+      this.registerLibraryFunctions(archive.manifest.functions);
+    }
+  }
+
+  /**
+   * A library function's parameter order and generic slots, from the manifest
+   * rather than the AST. Without the generic slots an argument bound to one is
+   * emitted as the variable itself instead of a descriptor.
+   */
+  private registerLibraryFunctions(
+    functions:
+      | Array<{
+          name: string;
+          parameters?: Array<{
+            name: string;
+            type: string;
+            direction?: string;
+          }>;
+        }>
+      | undefined,
+  ): void {
+    for (const fn of functions ?? []) {
+      const key = fn.name.toUpperCase();
+      const order: string[] = [];
+      for (const param of fn.parameters ?? []) {
+        order.push(param.name.toUpperCase());
+        // A generic is VAR_INPUT only.
+        if (
+          param.direction !== "output" &&
+          isDeclarableGenericType(param.type)
+        ) {
+          let params = this.functionGenericParams.get(key);
+          if (!params) {
+            params = new Map();
+            this.functionGenericParams.set(key, params);
+          }
+          params.set(param.name.toUpperCase(), param.type.toUpperCase());
+        }
+      }
+      if (order.length > 0 && !this.functionParamOrder.has(key)) {
+        this.functionParamOrder.set(key, order);
       }
     }
   }
@@ -3349,15 +3394,17 @@ export class CodeGenerator {
       return;
     }
 
-    // Bit access write: var.N := value → var = (var & ~(1ULL << N)) | ((value ? 1ULL : 0ULL) << N)
-    // Uses 1ULL (64-bit) to avoid UB when bit index >= 32 (e.g., LWORD.33)
-    if (
+    // Partial access write: `var.N := v` and `var.%B1 := v` alike become a
+    // read-modify-write of the whole variable. All arithmetic is 64-bit, so a
+    // shift of 32 or more (LWORD.%D1, LWORD.33) is not undefined behaviour.
+    const writePart =
       stmt.target.kind === "VariableExpression" &&
-      stmt.target.fieldAccess.length > 0 &&
-      /^\d+$/.test(stmt.target.fieldAccess[stmt.target.fieldAccess.length - 1]!)
-    ) {
-      const bitIdx =
-        stmt.target.fieldAccess[stmt.target.fieldAccess.length - 1]!;
+      stmt.target.fieldAccess.length > 0
+        ? parsePartialAccess(
+            stmt.target.fieldAccess[stmt.target.fieldAccess.length - 1]!,
+          )
+        : undefined;
+    if (stmt.target.kind === "VariableExpression" && writePart) {
       // Build the base variable (without the bit index)
       const baseVar: VariableExpression = {
         ...stmt.target,
@@ -3377,7 +3424,7 @@ export class CodeGenerator {
       const baseCode = this.generateExpression(baseVar);
       const value = this.generateExpression(stmt.value);
       this.emit(
-        `${indent}${baseCode} = (${baseCode} & ~(1ULL << ${bitIdx})) | ((${value} ? 1ULL : 0ULL) << ${bitIdx});`,
+        `${indent}${baseCode} = ${this.partialAccessWrite(baseCode, value, writePart)};`,
       );
       return;
     }
@@ -3456,10 +3503,12 @@ export class CodeGenerator {
     this.emit(`${indent}auto ${tmp} = ${value};`);
 
     const lastField = target.fieldAccess[target.fieldAccess.length - 1];
-    const isBitWrite =
-      target.fieldAccess.length > 0 && /^\d+$/.test(lastField ?? "");
+    const writePart =
+      target.fieldAccess.length > 0
+        ? parsePartialAccess(lastField ?? "")
+        : undefined;
 
-    if (isBitWrite) {
+    if (writePart) {
       // Base without the trailing bit index, rendered on the lock lambda param.
       const baseVar: VariableExpression = {
         ...target,
@@ -3472,7 +3521,7 @@ export class CodeGenerator {
       }
       const lv = this.renderAccessTail("(*__glk)", baseVar, nameUpper);
       this.emit(
-        `${indent}${ptr}->with_lock([&](auto* __glk){ ${lv} = (${lv} & ~(1ULL << ${lastField})) | ((${tmp} ? 1ULL : 0ULL) << ${lastField}); });`,
+        `${indent}${ptr}->with_lock([&](auto* __glk){ ${lv} = ${this.partialAccessWrite(lv, tmp, writePart)}; });`,
       );
       return;
     }
@@ -4129,9 +4178,12 @@ export class CodeGenerator {
       for (let i = 0; i < expr.fieldAccess.length; i++) {
         const field = expr.fieldAccess[i]!;
         const isLast = i === expr.fieldAccess.length - 1;
-        // Bit access: numeric field like .0, .15, .31 → ((var >> N) & 1)
-        if (/^\d+$/.test(field)) {
-          result = `((static_cast<uint64_t>(${result}) >> ${field}) & 1)`;
+        // Partial access: `.0`/`.%X0` for a bit, `.%B1`, `.%W0`, `.%D1` for a
+        // wider part. Shifted by the part's width, so index 0 is the least
+        // significant.
+        const part = parsePartialAccess(field);
+        if (part) {
+          result = this.partialAccessRead(result, part);
           continue;
         }
         if (isLast) {
@@ -4191,9 +4243,10 @@ export class CodeGenerator {
 
       switch (step.kind) {
         case "field": {
-          // Bit access: numeric field like .0, .15, .31
-          if (/^\d+$/.test(step.name)) {
-            result = `((static_cast<uint64_t>(${result}) >> ${step.name}) & 1)`;
+          // Partial access — see partialAccessRead.
+          const part = parsePartialAccess(step.name);
+          if (part) {
+            result = this.partialAccessRead(result, part);
             continue;
           }
           // Property access on the last step
@@ -5314,6 +5367,42 @@ export class CodeGenerator {
   }
 
   /**
+   * Read one part of a bit-field variable.
+   *
+   * `index` counts parts from the least significant end, so the shift is the
+   * part's own width times its index: `Do.%B3` is `(Do >> 24) & 0xFF`. All of
+   * it is done in 64 bits, so a shift of 32 or more is well defined.
+   */
+  private partialAccessRead(base: string, part: PartialAccess): string {
+    const shift = part.index * part.widthBits;
+    const mask =
+      part.widthBits === 1
+        ? "1"
+        : `0x${((1n << BigInt(part.widthBits)) - 1n).toString(16).toUpperCase()}ULL`;
+    return `((static_cast<uint64_t>(${base}) >> ${shift}) & ${mask})`;
+  }
+
+  /**
+   * The right-hand side of a partial-access write: the whole variable with one
+   * part replaced. Clears the part's bits, then ORs the value in, masked to the
+   * part's width so a wider value cannot corrupt its neighbours.
+   *
+   * A bit keeps its `value ? 1 : 0` form, since the source is a BOOL.
+   */
+  private partialAccessWrite(
+    base: string,
+    value: string,
+    part: PartialAccess,
+  ): string {
+    const shift = part.index * part.widthBits;
+    if (part.widthBits === 1) {
+      return `(${base} & ~(1ULL << ${shift})) | ((${value} ? 1ULL : 0ULL) << ${shift})`;
+    }
+    const mask = `0x${((1n << BigInt(part.widthBits)) - 1n).toString(16).toUpperCase()}ULL`;
+    return `(${base} & ~(${mask} << ${shift})) | ((static_cast<uint64_t>(${value}) & ${mask}) << ${shift})`;
+  }
+
+  /**
    * Remove the last field step from an access chain (for bit access / property trim).
    * Returns undefined if the chain becomes empty.
    */
@@ -5922,18 +6011,62 @@ export class CodeGenerator {
   private generateAnyDescriptor(expr: Expression): string | undefined {
     const declaredType = this.inferExprType(expr);
     if (!declaredType) return undefined;
-    const typeClass = TYPE_CLASS_BY_IEC_TYPE[declaredType.toUpperCase()];
-    if (!typeClass) return undefined;
 
     const value = this.generateExpression(expr);
-    if (typeClass === "TYPE_STRING" || typeClass === "TYPE_WSTRING") {
-      // The characters travel through raw_ptr(); the cached length does not.
-      this.pendingStringSyncs.push(value);
+    const element = arrayElementTypeName(declaredType);
+    if (element) return this.anyDescriptorForArray(value, element);
+
+    const typeClass = TYPE_CLASS_BY_IEC_TYPE[declaredType.toUpperCase()];
+    if (typeClass) {
+      if (typeClass === "TYPE_STRING" || typeClass === "TYPE_WSTRING") {
+        // The characters travel through raw_ptr(); the cached length does not.
+        this.pendingStringSyncs.push(value);
+      }
+      return (
+        `strucpp::IEC_ANY{ strucpp::TYPE_CLASS::${typeClass}, ` +
+        `reinterpret_cast<uint8_t*>(${value}.raw_ptr()), ` +
+        `static_cast<int32_t>(strucpp::IEC_SIZEOF(${value})), 1, ` +
+        `static_cast<int32_t>(sizeof(${value})) }`
+      );
     }
+
+    // A structure is TYPE_USERDEF and addressed whole; an enumeration is
+    // TYPE_ENUM and has a payload pointer.
+    if (this.isUserDefinedType(declaredType)) {
+      const isEnum = this.enumTypeMembers.has(declaredType.toUpperCase());
+      const cls = isEnum ? "TYPE_ENUM" : "TYPE_USERDEF";
+      const ptr = isEnum
+        ? `reinterpret_cast<uint8_t*>(${value}.raw_ptr())`
+        : `reinterpret_cast<uint8_t*>(&${value})`;
+      const size = isEnum
+        ? `static_cast<int32_t>(strucpp::IEC_SIZEOF(${value}))`
+        : `static_cast<int32_t>(sizeof(${value}))`;
+      return (
+        `strucpp::IEC_ANY{ strucpp::TYPE_CLASS::${cls}, ${ptr}, ${size}, 1, ` +
+        `static_cast<int32_t>(sizeof(${value})) }`
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * The descriptor for an array argument: `TYPE_ARRAY` whatever the elements
+   * are, `DISIZE` the payload packed, `DISTRIDE` the wrapper's width.
+   */
+  private anyDescriptorForArray(
+    value: string,
+    elementTypeName: string,
+  ): string {
+    const payload = this.typeCodeGen.mapTypeToCpp(elementTypeName);
+    const wrapper = this.typeCodeGen.mapStructFieldTypeToCpp(elementTypeName);
+    const count = `static_cast<int32_t>(${value}.element_count())`;
+    const base = TYPE_CLASS_BY_IEC_TYPE[elementTypeName.toUpperCase()]
+      ? `reinterpret_cast<uint8_t*>(${value}.elements()->raw_ptr())`
+      : `reinterpret_cast<uint8_t*>(${value}.elements())`;
     return (
-      `strucpp::IEC_ANY{ strucpp::TYPE_CLASS::${typeClass}, ` +
-      `reinterpret_cast<uint8_t*>(${value}.raw_ptr()), ` +
-      `static_cast<int32_t>(strucpp::IEC_SIZEOF(${value})) }`
+      `strucpp::IEC_ANY{ strucpp::TYPE_CLASS::TYPE_ARRAY, ${base}, ` +
+      `static_cast<int32_t>(${value}.element_count() * sizeof(${payload})), ` +
+      `${count}, static_cast<int32_t>(sizeof(${wrapper})) }`
     );
   }
 
