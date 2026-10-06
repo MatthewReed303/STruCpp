@@ -88,6 +88,7 @@ import {
   type EnumMemberEntry,
   type PartialAccess,
   TYPE_CLASS_BY_IEC_TYPE,
+  systemTypeClassMember,
   typeName as typeNameUtil,
 } from "../semantic/type-utils.js";
 import {
@@ -4560,6 +4561,12 @@ export class CodeGenerator {
   private generateVariableExpression(expr: VariableExpression): string {
     const nameUpper = expr.name.toUpperCase();
 
+    // CODESYS's `__SYSTEM.TYPE_CLASS.TYPE_INT` (the analyzer has checked the member)
+    const typeClassMember = systemTypeClassMember(expr);
+    if (typeClassMember !== undefined) {
+      return `strucpp::TYPE_CLASS::${typeClassMember}`;
+    }
+
     // Shared global. Under this global's own lock it reads through `(*__glk)`;
     // under another global's lock it is read into a temporary before that lock
     // is taken; otherwise it is one locked read (see renderGlobalRead).
@@ -4889,6 +4896,36 @@ export class CodeGenerator {
   };
 
   /**
+   * The runtime function for a DT → TOD or DT → DATE conversion
+   * (IEC 61131-3 table 22: DT_TO_TOD, DT_TO_DATE and their LDT / long-name
+   * forms), or undefined for any other pair.
+   *
+   * A DT is nanoseconds since 1970, a TOD nanoseconds since midnight and a
+   * DATE a day count, so these are not casts: the value has to be split.
+   * The plain TO_TOD / TO_DATE cast returned the whole DT.
+   */
+  private static dateTimeSplitFn(
+    fromUpper: string,
+    toUpper: string,
+  ): string | undefined {
+    const dt = ["DT", "DATE_AND_TIME", "LDT", "LDATE_AND_TIME"];
+    const tod = ["TOD", "TIME_OF_DAY", "LTOD", "LTIME_OF_DAY"];
+    if (!dt.includes(fromUpper)) return undefined;
+    if (tod.includes(toUpper)) return "TOD_OF_DT";
+    if (toUpper === "DATE" || toUpper === "LDATE") return "DATE_OF_DT";
+    return undefined;
+  }
+
+  private static readonly COMPARISON_OPS: ReadonlySet<string> = new Set([
+    "=",
+    "<>",
+    "<",
+    ">",
+    "<=",
+    ">=",
+  ]);
+
+  /**
    * Generate C++ for a binary expression.
    */
   private generateBinaryExpression(expr: BinaryExpression): string {
@@ -4911,6 +4948,12 @@ export class CodeGenerator {
       expr.operator === "OR" ||
       expr.operator === "XOR"
     ) {
+      // BOOL AND BOOL is BOOL. In C++ `bool & bool` promotes to int, which a
+      // template such as NOT, SEL or MAX then deduces as INT and rejects
+      // (`NOT(a > 0.0 AND b > 0.0)`), so a BOOL result is kept a bool.
+      if (this.inferExprType(expr) === "BOOL") {
+        return `static_cast<bool>((${left}) ${cppOp} (${right}))`;
+      }
       return `(${left}) ${cppOp} (${right})`;
     }
 
@@ -5079,6 +5122,7 @@ export class CodeGenerator {
       case "UnaryExpression":
         return this.inferExprType(expr.operand);
       case "BinaryExpression": {
+        if (CodeGenerator.COMPARISON_OPS.has(expr.operator)) return "BOOL";
         // For bitwise/arithmetic ops, infer from operands
         const lt = this.inferExprType(expr.left);
         const rt = this.inferExprType(expr.right);
@@ -5553,6 +5597,13 @@ export class CodeGenerator {
     // 1. Check for *_TO_* conversion pattern (e.g., INT_TO_REAL -> TO_REAL)
     const conversion = this.stdRegistry.resolveConversion(nameUpper);
     if (conversion) {
+      const split = CodeGenerator.dateTimeSplitFn(
+        conversion.fromType.toUpperCase(),
+        conversion.toType.toUpperCase(),
+      );
+      if (split && expr.arguments.length === 1) {
+        return `${split}(${this.generateExpression(expr.arguments[0]!.value)})`;
+      }
       const args = expr.arguments.map((arg, idx) => {
         const generated = this.generateExpression(arg.value);
         if (idx !== 0) return generated;
@@ -5580,6 +5631,22 @@ export class CodeGenerator {
     // 2. Check for standard function (may have different cppName)
     const stdFunc = this.stdRegistry.lookup(nameUpper);
     if (stdFunc) {
+      if (
+        stdFunc.isConversion &&
+        stdFunc.specificReturnType &&
+        expr.arguments.length === 1
+      ) {
+        const fromType = this.inferExprType(expr.arguments[0]!.value);
+        const split = fromType
+          ? CodeGenerator.dateTimeSplitFn(
+              fromType.toUpperCase(),
+              stdFunc.specificReturnType.toUpperCase(),
+            )
+          : undefined;
+        if (split) {
+          return `${split}(${this.generateExpression(expr.arguments[0]!.value)})`;
+        }
+      }
       const args = expr.arguments.map((arg, idx) => {
         let generated = this.generateExpression(arg.value);
         // For the bare `TO_xxx(temporal_var)` spelling, `nameUpper` is

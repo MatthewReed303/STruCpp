@@ -58,6 +58,8 @@ import {
   type ArrayShape,
   type EnumMemberEntry,
   TYPE_CATEGORIES,
+  TYPE_CLASS_MEMBERS,
+  systemTypeClassMember,
 } from "./type-utils.js";
 import {
   isEnArgument,
@@ -4138,7 +4140,20 @@ export class SemanticAnalyzer {
     ctx: UndeclaredVarContext,
   ): void {
     switch (expr.kind) {
-      case "VariableExpression":
+      case "VariableExpression": {
+        // CODESYS's `__SYSTEM.TYPE_CLASS.TYPE_INT`: a constant, not a variable
+        const typeClassMember = systemTypeClassMember(expr);
+        if (typeClassMember !== undefined) {
+          if (!TYPE_CLASS_MEMBERS.includes(typeClassMember)) {
+            this.addError(
+              `'${typeClassMember}' is not a member of __SYSTEM.TYPE_CLASS`,
+              expr.sourceSpan.startLine,
+              expr.sourceSpan.startCol,
+              expr.sourceSpan.file,
+            );
+          }
+          break;
+        }
         this.checkNameDeclared(expr.name, scope, ctx, expr.sourceSpan);
         // Reject member access on a type-level symbol (FB / program / type).
         // Resolves the bug where `RED_YELLOW_GREEN.GREENTIME := …` is
@@ -4166,6 +4181,7 @@ export class SemanticAnalyzer {
           }
         }
         break;
+      }
       case "FunctionCallExpression":
         // For dotted names (fb.method), check only the object part
         if (expr.functionName.includes(".")) {

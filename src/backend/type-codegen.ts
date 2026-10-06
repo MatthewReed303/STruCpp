@@ -398,6 +398,7 @@ export class TypeCodeGenerator {
         const elemCpp = this.arrayElementTypeToCpp(
           field.type.elementTypeName,
           field.type.elementReferenceChain,
+          field.type.elementMaxLength,
         );
         cppType = formatArrayType(elemCpp, field.type.arrayDimensions);
       } else {
@@ -515,6 +516,7 @@ export class TypeCodeGenerator {
       elementKind === undefined || elementKind === "none"
         ? undefined
         : (def.elementType.referenceChain ?? [elementKind]),
+      def.elementType.maxLength,
     );
     const numDims = def.dimensions.length;
 
@@ -608,15 +610,18 @@ export class TypeCodeGenerator {
   /**
    * The C++ element type of an array: the IECVar-wrapped type for a value
    * element, or for an element declared POINTER TO / REF_TO the wrapper a
-   * variable of that type gets (`IEC_Ptr<INT_t>`).
+   * variable of that type gets (`IEC_Ptr<INT_t>`). `maxLength` is a STRING /
+   * WSTRING element's declared length — `ARRAY[1..4] OF STRING(60)` — which
+   * would otherwise fall back to 254.
    */
   private arrayElementTypeToCpp(
     typeName: string,
     referenceChain: readonly string[] | undefined,
+    maxLength?: number | string,
   ): string {
     return referenceChain
       ? wrapReferenceChain(referenceChain, this.mapTypeToCpp(typeName))
-      : this.mapStructFieldTypeToCpp(typeName);
+      : this.mapStructFieldTypeToCpp(typeName, maxLength);
   }
 
   /**
