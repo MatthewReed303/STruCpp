@@ -2608,22 +2608,25 @@ export class CodeGenerator {
       if (block.blockType === "VAR_INPUT") {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
-            params.push(`${this.mapTypeRefToCpp(decl.type)} ${name}`);
+            params.push(
+              `${this.mapTypeRefToCpp(decl.type)} ${this.functionVarName(name, decl.type.name)}`,
+            );
           }
         }
       } else if (block.blockType === "VAR_IN_OUT") {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
             // VLA types (ArrayView) are already reference-like; others need &
+            const pname = this.functionVarName(name, decl.type.name);
             if (decl.type.name.startsWith("__VLA_")) {
-              params.push(`${this.mapTypeRefToCpp(decl.type)} ${name}`);
+              params.push(`${this.mapTypeRefToCpp(decl.type)} ${pname}`);
             } else {
               // mapTypeRefToCpp preserves arrayDimensions / elementTypeName
               // (so inline ARRAY params emit Array1D<...>) but we still want
               // STRING/WSTRING maxLength dropped so any string size binds to
               // the &-reference — strip it on a shallow copy of the typeRef.
               params.push(
-                `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
+                `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${pname}`,
               );
             }
           }
@@ -2633,13 +2636,22 @@ export class CodeGenerator {
           for (const name of decl.names) {
             // Same metadata-aware lookup as VAR_IN_OUT — see the comment above.
             params.push(
-              `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${name}`,
+              `${this.mapTypeRefToCpp(this.toParamTypeRef(decl.type))}& ${this.functionVarName(name, decl.type.name)}`,
             );
           }
         }
       }
     }
     return params;
+  }
+
+  /** The C++ name of a function parameter or local: `<name>_` when it is
+   *  named like its own user type, as the body refers to it (enterScope). */
+  private functionVarName(name: string, typeName: string): string {
+    return this.isUserDefinedType(typeName) &&
+      name.toUpperCase() === typeName.toUpperCase()
+      ? `${name}_`
+      : name;
   }
 
   // ===========================================================================
@@ -3144,7 +3156,9 @@ export class CodeGenerator {
               const initValue = decl.initialValue
                 ? ` = ${this.generateInitializer(decl.initialValue, cppType, decl.type.name)}`
                 : "";
-              this.emit(`    ${cppType} ${name}${initValue};`);
+              this.emit(
+                `    ${cppType} ${this.functionVarName(name, decl.type.name)}${initValue};`,
+              );
             }
           }
         }
@@ -3206,7 +3220,7 @@ export class CodeGenerator {
       if (block.blockType === "VAR_INPUT" || block.blockType === "VAR_IN_OUT") {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
-            names.push(name);
+            names.push(this.functionVarName(name, decl.type.name));
           }
         }
       }
@@ -4292,6 +4306,9 @@ export class CodeGenerator {
     for (const caseElement of stmt.cases) {
       this.emitLineDirective(caseElement.sourceSpan.startLine);
       const caseLabelLine = this.currentLine;
+      // Each branch body is its own block: a declaration in it (a temporary of
+      // a shared-global write, say) must not be jumped over by a later label.
+      const labelLines: string[] = [];
       for (const label of caseElement.labels) {
         if (label.end) {
           // Range: expand to individual case labels
@@ -4299,29 +4316,38 @@ export class CodeGenerator {
           const endVal = this.evaluateLiteralInt(label.end);
           if (startVal !== undefined && endVal !== undefined) {
             for (let i = startVal; i <= endVal; i++) {
-              this.emit(`${innerIndent}case ${i}:`);
+              labelLines.push(`${innerIndent}case ${i}:`);
             }
           } else {
             // Fallback: emit as comment with expression
-            this.emit(
+            labelLines.push(
               `${innerIndent}case ${this.generateExpression(label.start)}: // range to ${this.generateExpression(label.end)}`,
             );
           }
         } else {
-          this.emit(
+          labelLines.push(
             `${innerIndent}case ${this.generateExpression(label.start)}:`,
           );
         }
       }
+      const last = labelLines.length - 1;
+      if (last >= 0 && !labelLines[last]!.includes("//")) {
+        labelLines[last] += " {";
+      } else {
+        labelLines.push(`${innerIndent}{`);
+      }
+      for (const line of labelLines) this.emit(line);
       this.recordLineMapping(caseElement.sourceSpan.startLine, caseLabelLine);
       this.generateStatements(caseElement.statements, bodyIndent);
       this.emit(`${bodyIndent}break;`);
+      this.emit(`${innerIndent}}`);
     }
 
     if (stmt.elseStatements.length > 0) {
-      this.emit(`${innerIndent}default:`);
+      this.emit(`${innerIndent}default: {`);
       this.generateStatements(stmt.elseStatements, bodyIndent);
       this.emit(`${bodyIndent}break;`);
+      this.emit(`${innerIndent}}`);
     }
 
     this.emitLineDirective(stmt.sourceSpan.endLine);
