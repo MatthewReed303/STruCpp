@@ -85,6 +85,12 @@ export interface LibraryVarType {
   /** Every reference level, outermost first, when there is more than one */
   referenceChain?: ReferenceKind[];
   /**
+   * An input's declared default, as an ST expression string (e.g. "TRUE",
+   * "T#10s"). Present only on `inputs` declared with an initial value, the way
+   * a function parameter's `initialValue` is: such a pin may be left unwired.
+   */
+  initialValue?: string;
+  /**
    * The C++ member name, when it differs from `name`.
    *
    * Emitted only when the library's own codegen mangled it — a member whose
