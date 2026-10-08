@@ -247,7 +247,57 @@ extern const uint16_t  retain_var_count;
 
 // Identity of the retain LAYOUT (ordered path|typeTag), not of the program: a
 // body edit keeps retained values, a declaration change invalidates them.
+// Since retain format 2 it only RECOGNISES a format-1 blob, which carries no
+// per-leaf names and so can be restored only into an identical layout; a
+// format-2 blob is matched leaf by leaf through `retain_leaves[]` below.
 extern const uint32_t  retain_layout_hash;
+
+// ---------------------------------------------------------------------------
+// Retained-leaf identities (retain format 2). Parallel to `retain_vars[]`: same
+// count, same order.
+//
+// A retained value belongs to a VARIABLE, and a variable is named by its path:
+// IEC 61131-3 6.5.6.1 rule 1 (p.57) keeps "the values the variables had when
+// the resource or configuration was stopped". So the stored blob carries each
+// value's name — compressed to a 32-bit FNV-1a hash of the canonical path,
+// upper case because 6.1.2 (p.24) makes identifiers case-insensitive — and a
+// program whose declarations changed takes back every value whose variable
+// still exists, by name, instead of refusing all of them.
+//
+//   id     FNV-1a32 of the canonical path. For an element of an innermost
+//          array of scalars the hashed path is the ARRAY's ("CFG.SPARE[]") and
+//          the subscript goes in `index`, so a resized array keeps its elements
+//          by subscript and the blob can describe the whole array as one run.
+//          An enumerated or subrange type's definition is folded into the hash
+//          (`path|ENUM ...`): changing the enumeration makes it a different
+//          variable, never a number re-read with another meaning.
+//   index  the declared subscript, or RETAIN_NO_INDEX.
+//   tag    the TypeTag; `cap` the declared STRING/WSTRING length (0 = 254).
+//
+// The generator refuses a program in which two retained leaves share
+// (id, index), so one hash can never name two variables of one program.
+// ---------------------------------------------------------------------------
+struct RetainLeaf {
+    uint32_t id;
+    int32_t  index;
+    uint8_t  tag;
+    uint8_t  cap;
+};
+
+constexpr int32_t RETAIN_NO_INDEX = static_cast<int32_t>(0x80000000u);
+
+extern const RetainLeaf retain_leaves[] STRUCPP_DEBUG_FLASH;
+
+/** One retained leaf with everything the retain walk needs, read out of flash
+ *  by `handle_retain_leaf()` (debug_dispatch.hpp). */
+struct RetainLeafInfo {
+    uint8_t  arr;
+    uint16_t elem;
+    uint32_t id;
+    int32_t  index;
+    uint8_t  tag;
+    uint8_t  cap;
+};
 
 // Consecutive leaves of one locked global `g`: elements [first, first + count)
 // of debug array `arr`. A threaded build lists them so a runtime can take the

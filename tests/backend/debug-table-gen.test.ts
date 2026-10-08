@@ -1028,8 +1028,10 @@ END_PROGRAM${CFG_R}`,
   });
 
   it("reports the blob size the target has to be able to hold", () => {
-    // 14-byte header + DINT(4) + BOOL(1). The editor gates a build on this;
-    // getting it wrong there means firmware that silently drops retain.
+    // Format 2: 14-byte header + DINT(4) + BOOL(1) + a trailer of 4 bytes and
+    // one 6-byte entry per variable. The editor gates a build on this and the
+    // firmware sizes its buffer from it; getting it wrong there means firmware
+    // that silently drops retain.
     const { map } = mapOf(
       `PROGRAM Main
 VAR RETAIN boots : DINT; END_VAR
@@ -1038,7 +1040,53 @@ VAR live : DINT; END_VAR
   live := boots;
 END_PROGRAM${CFG_R}`,
     );
-    expect(map.retainBlobSize).toBe(14 + 4 + 1);
+    expect(map.retainBlobSize).toBe(14 + 4 + 1 + 4 + 2 * 6);
+    expect(map.retainFormat).toBe(2);
+  });
+
+  it("names every retained leaf in retain_leaves[] (format 2): path hash, subscript, type, length", () => {
+    const { map, cpp } = mapOf(
+      `TYPE MODE_T : (OFF, AUTO) := OFF; END_TYPE
+PROGRAM Main
+VAR RETAIN boots : DINT; spare : ARRAY[1..3] OF INT; site : STRING(20); mode : MODE_T; END_VAR
+  boots := boots;
+END_PROGRAM${CFG_R}`,
+    );
+    const ids = map.retainVars!.map((v) => [v.path, v.id, v.index]);
+    // Array elements share the array's identity and carry their subscript.
+    expect(ids[1]![1]).toBe(ids[2]![1]);
+    expect(ids.slice(1, 4).map((x) => x[2])).toEqual([1, 2, 3]);
+    expect(ids[0]![2]).toBeUndefined();
+    const fnv = (t: string) => {
+      let h = 0x811c9dc5;
+      for (const b of Buffer.from(t)) h = Math.imul(h ^ b, 0x01000193) >>> 0;
+      return h.toString(16).padStart(8, "0");
+    };
+    expect(ids[0]![1]).toBe(fnv("INSTANCE0.BOOTS"));
+    expect(ids[1]![1]).toBe(fnv("INSTANCE0.SPARE[]"));
+    // An enumeration's definition is part of its identity.
+    expect(ids[5]![1]).toBe(fnv("INSTANCE0.MODE|ENUM MODE_T:(OFF,AUTO)"));
+    expect(cpp).toContain("const RetainLeaf retain_leaves[6] STRUCPP_DEBUG_FLASH = {");
+    expect(cpp).toMatch(/\{ 0x[0-9a-f]{8}u, RETAIN_NO_INDEX, TAG_DINT, 0 \},\s*\/\/ INSTANCE0\.BOOTS/);
+    expect(cpp).toMatch(/\{ 0x[0-9a-f]{8}u, 2, TAG_INT, 0 \},\s*\/\/ INSTANCE0\.SPARE\[2\]/);
+    expect(cpp).toMatch(/TAG_STRING, 20 \},\s*\/\/ INSTANCE0\.SITE/);
+    // header 14 + payload (4 + 3*2 + 21 + 2) + trailer 4 + 3 singles*6 + 1 run*12
+    expect(map.retainBlobSize).toBe(14 + 33 + 4 + 18 + 12);
+  });
+
+  it("refuses two retained variables with one retain identity", () => {
+    // FNV-1a32("INSTANCE0.V248911") == FNV-1a32("INSTANCE0.V1208910").
+    const r = compile(
+      `PROGRAM Main
+VAR RETAIN V248911 : DINT; V1208910 : DINT; END_VAR
+  V248911 := V1208910;
+END_PROGRAM${CFG_R}`,
+      { headerFileName: "generated.hpp" },
+    );
+    expect(r.success).toBe(false);
+    expect(r.errors.map((e) => e.message).join("\n")).toMatch(
+      /'INSTANCE0\.V248911' and 'INSTANCE0\.V1208910' have the same retain identity/,
+    );
   });
 
   it("omits the blob size when nothing is retained", () => {

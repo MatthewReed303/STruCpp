@@ -821,6 +821,30 @@ export function compile(
     debugTableCpp = dbg.debugTableCpp;
     debugMap = dbg.debugMap;
 
+    // Two retained variables with one retain identity: refused, because the
+    // restore matches stored values to variables by that identity, and a
+    // value that can land in the wrong variable is worse than no value.
+    if (dbg.retainErrors.length > 0) {
+      for (const item of dbg.retainErrors) {
+        pipeline.errors.push({
+          message: item.reason,
+          line: 0,
+          column: 0,
+          severity: "error",
+        });
+      }
+      return {
+        success: false,
+        cppFiles: [],
+        cppCode: "",
+        headerCode: "",
+        lineMap: new Map(),
+        headerLineMap: new Map(),
+        errors: pipeline.errors,
+        warnings: pipeline.warnings,
+      };
+    }
+
     // A RETAIN the walk could not follow all the way down is a WARNING, not an
     // error. The program still builds and its visible surface is still
     // retained; refusing would strand anyone using a third-party .stlib they

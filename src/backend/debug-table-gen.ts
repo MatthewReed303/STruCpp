@@ -28,6 +28,8 @@ import type {
   ProgramDeclaration,
   TypeReference,
   StructDefinition,
+  EnumDefinition,
+  SubrangeDefinition,
   VarBlock,
   VarDeclaration,
 } from "../frontend/ast.js";
@@ -155,6 +157,135 @@ const RETAIN_HEADER_SIZE = 14;
  * against accident, not against an attacker, and it has to be computable in a
  * few lines on an AVR as well as here.
  */
+function fnv1a32(text: string): number {
+  let hash = 0x811c9dc5;
+  for (const byte of Buffer.from(text, "utf8")) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+/**
+ * Mirrors `strucpp::debug::RETAIN_NO_INDEX` (debug_table.hpp): the leaf is not
+ * an element of an innermost array of scalars.
+ */
+const RETAIN_NO_INDEX = -0x80000000;
+
+/**
+ * A retained leaf's identity in a format-2 blob (`retain_leaves[]`).
+ *
+ * The name of the VARIABLE, because IEC 61131-3 6.5.6.1 rule 1 (p.57) keeps
+ * "the values the variables had when the resource or configuration was
+ * stopped": an upload that adds a member to a RETAIN struct must give every
+ * other member its value back, and only a name can say which value is whose.
+ * Paths are already canonical — upper case (6.1.2, p.24: identifiers are
+ * case-insensitive), dotted, declared subscripts.
+ *
+ * An element of an innermost array of scalars hashes the array's path
+ * (`CFG.SPARE[]`) and carries its subscript separately, so a resized array
+ * keeps its elements by subscript and the blob describes the array as one run.
+ *
+ * `typeSig` (enumerated and subrange types) is folded into the hash: a changed
+ * enumeration is a different variable, never a stored number re-read with a
+ * different meaning.
+ */
+export function retainIdentityOf(
+  path: string,
+  typeSig?: string,
+): { id: number; index: number } {
+  const sig = typeSig ? `|${typeSig}` : "";
+  const m = /^(.*)\[(-?\d+)\]$/.exec(path);
+  if (m) {
+    return { id: fnv1a32(`${m[1]}[]${sig}`), index: Number(m[2]) };
+  }
+  return { id: fnv1a32(`${path}${sig}`), index: RETAIN_NO_INDEX };
+}
+
+/** Format-2 payload width of a leaf: natural width, or 1 + declared length. */
+function retainPayloadWidth(
+  tagName: TagName,
+  size: number,
+  cap: number,
+): number {
+  const declared = cap >= 1 && cap <= 254 ? cap : 254;
+  if (tagName === "STRING") return 1 + declared;
+  if (tagName === "WSTRING") return 1 + 2 * declared;
+  return size;
+}
+
+/**
+ * Bytes of this program's format-2 blob: header, exact-width payload and the
+ * descriptor trailer (iec_retain.hpp). Mirrors `strucpp::retain::blob_size2()`.
+ * A string whose length this generator could not resolve (a symbolic
+ * `STRING(N)`) is counted at the 254 maximum, so the figure is an upper bound
+ * there and exact everywhere else.
+ */
+function retainBlobSize2Of(
+  vars: Array<{
+    path: string;
+    tagName: TagName;
+    size: number;
+    cap: number;
+    typeSig?: string;
+  }>,
+): number {
+  let payload = 0;
+  let trailer = 4;
+  let open:
+    | { id: number; tag: TagName; cap: number; next: number; count: number }
+    | undefined;
+  for (const v of vars) {
+    payload += retainPayloadWidth(v.tagName, v.size, v.cap);
+    const { id, index } = retainIdentityOf(v.path, v.typeSig);
+    if (
+      open !== undefined &&
+      index !== RETAIN_NO_INDEX &&
+      open.id === id &&
+      open.tag === v.tagName &&
+      open.cap === v.cap &&
+      open.next === index &&
+      open.count < 0xffff
+    ) {
+      open.next++;
+      open.count++;
+      continue;
+    }
+    if (index === RETAIN_NO_INDEX) {
+      open = undefined;
+      trailer += 6;
+    } else {
+      open = { id, tag: v.tagName, cap: v.cap, next: index + 1, count: 1 };
+      trailer += 12;
+    }
+  }
+  return RETAIN_HEADER_SIZE + payload + trailer;
+}
+
+/**
+ * An enumerated type's definition, for the retained-leaf identity: its name and
+ * its members in order with their values. Two enumerations that differ in any
+ * of these are different data types, so a stored value of one is not a value
+ * of the other (it was a member name, stored as its number).
+ */
+function enumSignature(name: string, def: EnumDefinition): string {
+  const members = def.members.map((m) => {
+    const value = m.value !== undefined ? evalIntConst(m.value) : undefined;
+    return value !== undefined
+      ? `${m.name.toUpperCase()}=${value}`
+      : m.name.toUpperCase();
+  });
+  const base = def.baseType?.name?.toUpperCase() ?? "";
+  return `ENUM ${name.toUpperCase()}:${base}(${members.join(",")})`;
+}
+
+/** A subrange type's definition (name, base, bounds), for the same reason. */
+function subrangeSignature(name: string, def: SubrangeDefinition): string {
+  const lo = evalIntConst(def.lowerBound);
+  const hi = evalIntConst(def.upperBound);
+  return `SUBRANGE ${name.toUpperCase()}:${def.baseType.name.toUpperCase()}(${lo ?? "?"}..${hi ?? "?"})`;
+}
+
 function retainLayoutHashOf(
   vars: Array<{ path: string; tagName: TagName }>,
 ): string {
@@ -348,6 +479,10 @@ export interface DebugMapV2 {
     elemIdx: number;
     path: string;
     size: number;
+    /** Retain identity (FNV-1a32, hex) — `retain_leaves[].id`. */
+    id?: string;
+    /** Declared subscript, for an element of an innermost array of scalars. */
+    index?: number;
   }>;
   /**
    * Total bytes the retain blob occupies: a 14-byte header plus one payload
@@ -358,6 +493,8 @@ export interface DebugMapV2 {
    * degrades to NON_RETAIN in silence.
    */
   retainBlobSize?: number;
+  /** Retain blob format the program writes (iec_retain.hpp): 2. Absent = 1. */
+  retainFormat?: number;
   /**
    * Identity of the retain LAYOUT, not of the program.
    *
@@ -377,6 +514,12 @@ export interface DebugTableResult {
   /** Any leaves that couldn't be classified (unsupported type construct,
    *  user-defined enum, reference, etc.). Useful for warnings. */
   skipped: Array<{ path: string; reason: string }>;
+  /**
+   * Retained leaves whose identities collide (same 32-bit hash and subscript).
+   * A build ERROR: a retained value restored by name must never be able to
+   * land in a different variable. Renaming either variable resolves it.
+   */
+  retainErrors: Array<{ path: string; reason: string }>;
   /** Retained state the walk could not reach; surfaced as compile warnings. */
   incomplete: Array<{ path: string; reason: string }>;
 }
@@ -514,6 +657,12 @@ export function generateDebugTable(
     path: string;
     size: number;
     tagName: TagName;
+    /** Declared STRING/WSTRING length when known here, else 0 (see capLiteral). */
+    cap: number;
+    /** The leaf's Entry, so retain_leaves[] can reuse its cap expression. */
+    entry: Entry;
+    /** Enumerated / subrange type definition, folded into the identity. */
+    typeSig?: string;
   }> = [];
   const skipped: Array<{ path: string; reason: string }> = [];
 
@@ -598,6 +747,7 @@ export function generateDebugTable(
     iecName: string,
     flags: number,
     maxLength?: number | string,
+    typeSig?: string,
   ) => {
     if (flags & WALK_RETAINED_ONLY) {
       if (!(flags & LEAF_FLAG_RETAIN)) return;
@@ -620,7 +770,7 @@ export function generateDebugTable(
         ? maxLength
         : 0;
     const ind = indirectStack[indirectStack.length - 1];
-    bucket.push({
+    const entry: Entry = {
       cppExpr,
       tagName,
       path,
@@ -631,7 +781,8 @@ export function generateDebugTable(
       ...(ind !== undefined
         ? { indirect: { binding: ind.binding, proto: ind.proto } }
         : {}),
-    });
+    };
+    bucket.push(entry);
     leaves.push({
       arrayIdx: arrIdx,
       elemIdx,
@@ -646,7 +797,16 @@ export function generateDebugTable(
         : {}),
     });
     if (flags & LEAF_FLAG_RETAIN) {
-      retainVars.push({ arrayIdx: arrIdx, elemIdx, path, size, tagName });
+      retainVars.push({
+        arrayIdx: arrIdx,
+        elemIdx,
+        path,
+        size,
+        tagName,
+        cap,
+        entry,
+        ...(typeSig !== undefined ? { typeSig } : {}),
+      });
     }
   };
 
@@ -791,7 +951,14 @@ export function generateDebugTable(
         // matches the base. Default INT if no baseType.
         const baseName = def.baseType?.name?.toUpperCase() ?? "INT";
         if (IEC_NAME_TO_TAG[baseName] !== undefined) {
-          addLeaf(path, cppExpr, baseName, flags);
+          addLeaf(
+            path,
+            cppExpr,
+            baseName,
+            flags,
+            undefined,
+            enumSignature(name, def),
+          );
           return;
         }
         skipped.push({ path, reason: `enum base type ${baseName} unknown` });
@@ -800,7 +967,14 @@ export function generateDebugTable(
       if (def.kind === "SubrangeDefinition") {
         const baseName = def.baseType.name.toUpperCase();
         if (IEC_NAME_TO_TAG[baseName] !== undefined) {
-          addLeaf(path, cppExpr, baseName, flags);
+          addLeaf(
+            path,
+            cppExpr,
+            baseName,
+            flags,
+            undefined,
+            subrangeSignature(name, def),
+          );
           return;
         }
         skipped.push({ path, reason: `subrange base ${baseName} unknown` });
@@ -1350,6 +1524,31 @@ export function generateDebugTable(
 
   const configName = projectModel.configurations[0]?.name ?? "CONFIG0";
   const retainLayoutHash = retainLayoutHashOf(retainVars);
+  // Identities of the retained leaves (retain format 2), and the guarantee the
+  // restore relies on: no two retained leaves of one program share one.
+  const retainIdentities = retainVars.map((v) =>
+    retainIdentityOf(v.path, v.typeSig),
+  );
+  const retainErrors: Array<{ path: string; reason: string }> = [];
+  {
+    const seen = new Map<string, string>();
+    retainVars.forEach((v, i) => {
+      const { id, index } = retainIdentities[i]!;
+      const key = `${id}:${index}`;
+      const other = seen.get(key);
+      if (other !== undefined) {
+        retainErrors.push({
+          path: v.path,
+          reason:
+            `retained variables '${other}' and '${v.path}' have the same retain ` +
+            `identity (hash ${id.toString(16).padStart(8, "0")}): a restored value ` +
+            `could reach the wrong one. Rename one of them.`,
+        });
+      } else {
+        seen.set(key, v.path);
+      }
+    });
+  }
   // Each global's leaves as runs within one array: {array, first, count, g}.
   const globalRuns: GlobalLeafRun[] = [];
   for (const { start, end, g } of globalLeaves) {
@@ -1379,6 +1578,7 @@ export function generateDebugTable(
     configGlobal,
     configName,
     retainVars,
+    retainIdentities,
     retainLayoutHash,
     globalRuns,
   );
@@ -1393,23 +1593,30 @@ export function generateDebugTable(
     // fast path is the only thing it ever sees.
     ...(retainVars.length > 0
       ? {
-          retainVars: retainVars.map(({ arrayIdx, elemIdx, path, size }) => ({
-            arrayIdx,
-            elemIdx,
-            path,
-            size,
-          })),
+          retainVars: retainVars.map(
+            ({ arrayIdx, elemIdx, path, size }, i) => ({
+              arrayIdx,
+              elemIdx,
+              path,
+              size,
+              id: retainIdentities[i]!.id.toString(16).padStart(8, "0"),
+              ...(retainIdentities[i]!.index !== RETAIN_NO_INDEX
+                ? { index: retainIdentities[i]!.index }
+                : {}),
+            }),
+          ),
           retainLayoutHash,
-          // 14 == strucpp::retain::HEADER_SIZE (iec_retain.hpp). Emitted so a
-          // build can be refused when the target cannot hold the blob.
-          retainBlobSize:
-            RETAIN_HEADER_SIZE +
-            retainVars.reduce((total, v) => total + v.size, 0),
+          // The format-2 blob (iec_retain.hpp): 14-byte header, exact-width
+          // payload, descriptor trailer. Emitted so a build can be refused
+          // when the target cannot hold the blob, and so a firmware sizes its
+          // buffer from it.
+          retainBlobSize: retainBlobSize2Of(retainVars),
+          retainFormat: 2,
         }
       : {}),
   };
 
-  return { debugTableCpp, debugMap, skipped, incomplete };
+  return { debugTableCpp, debugMap, skipped, incomplete, retainErrors };
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,7 +1838,14 @@ function renderCpp(
   arrays: Entry[][],
   configGlobal: string,
   configName: string,
-  retainVars: Array<{ arrayIdx: number; elemIdx: number; path: string }>,
+  retainVars: Array<{
+    arrayIdx: number;
+    elemIdx: number;
+    path: string;
+    tagName: TagName;
+    entry: Entry;
+  }>,
+  retainIdentities: Array<{ id: number; index: number }>,
   retainLayoutHash: string,
   globalRuns: GlobalLeafRun[],
 ): string {
@@ -1766,6 +1980,34 @@ function renderCpp(
   );
   lines.push("// invalidates them.");
   lines.push(`const uint32_t retain_layout_hash = 0x${retainLayoutHash};`);
+  lines.push("");
+  // Format-2 identities, parallel to retain_vars[] (debug_table.hpp).
+  lines.push(
+    "// Each retained leaf's identity: FNV-1a32 of its canonical path, subscript,",
+  );
+  lines.push(
+    "// type and declared length. A changed program takes back every stored value",
+  );
+  lines.push(
+    "// whose variable still exists, by name (iec_retain.hpp, format 2).",
+  );
+  lines.push(
+    `const RetainLeaf retain_leaves[${retainVars.length || 1}] STRUCPP_DEBUG_FLASH = {`,
+  );
+  if (retainVars.length === 0) {
+    lines.push(
+      "    { 0, RETAIN_NO_INDEX, 0, 0 },  // placeholder — nothing is retained",
+    );
+  } else {
+    retainVars.forEach((v, i) => {
+      const { id, index } = retainIdentities[i]!;
+      const idx = index === RETAIN_NO_INDEX ? "RETAIN_NO_INDEX" : String(index);
+      lines.push(
+        `    { 0x${id.toString(16).padStart(8, "0")}u, ${idx}, TAG_${v.tagName}, ${capLiteral(v.entry)} },  // ${v.path}`,
+      );
+    });
+  }
+  lines.push("};");
   lines.push("");
 
   // --- Leaf -> global ------------------------------------------------------

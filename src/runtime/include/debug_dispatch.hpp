@@ -689,6 +689,134 @@ inline const void* handle_ptr(uint8_t arr, uint16_t elem, uint16_t* out_len) noe
     return p;
 }
 
+// ---------------------------------------------------------------------------
+// Retain support (retain format 2, iec_retain.hpp).
+//
+// The retain walk lives in iec_retain.hpp, which generated code includes and
+// which therefore must stay free of <avr/pgmspace.h>. Everything that reads the
+// flash-resident retain tables, or reaches a string's full storage, is here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Retained leaf `i` (0 .. retain_var_count-1): its debug address from
+ * `retain_vars[]` and its identity from `retain_leaves[]`. False past the end.
+ *
+ * Both tables are STRUCPP_DEBUG_FLASH, so on AVR they are read with the same
+ * accessors read_entry() uses for the entry tables: far on a RAMPZ chip, whose
+ * tables may lie above 64 KB, near otherwise. A plain array access there would
+ * read SRAM at the flash address — every value restored into the wrong leaf.
+ */
+inline bool handle_retain_leaf(uint16_t i, RetainLeafInfo* out) noexcept {
+    if (!out || i >= retain_var_count) return false;
+#if defined(__AVR__)
+#  if defined(RAMPZ)
+    const uint32_t v = pgm_get_far_address(retain_vars) + uint32_t{i} * sizeof(RetainVar);
+    const uint32_t l = pgm_get_far_address(retain_leaves) + uint32_t{i} * sizeof(RetainLeaf);
+#    define STRUCPP_RETAIN_FLASH_U8(a)  pgm_read_byte_far(a)
+#    define STRUCPP_RETAIN_FLASH_U16(a) pgm_read_word_far(a)
+#    define STRUCPP_RETAIN_FLASH_U32(a) pgm_read_dword_far(a)
+#  else
+    const uint16_t v = reinterpret_cast<uint16_t>(&retain_vars[i]);
+    const uint16_t l = reinterpret_cast<uint16_t>(&retain_leaves[i]);
+#    define STRUCPP_RETAIN_FLASH_U8(a)  pgm_read_byte(a)
+#    define STRUCPP_RETAIN_FLASH_U16(a) pgm_read_word(a)
+#    define STRUCPP_RETAIN_FLASH_U32(a) pgm_read_dword(a)
+#  endif
+    out->arr   = STRUCPP_RETAIN_FLASH_U8(v + offsetof(RetainVar, arr));
+    out->elem  = STRUCPP_RETAIN_FLASH_U16(v + offsetof(RetainVar, elem));
+    out->id    = STRUCPP_RETAIN_FLASH_U32(l + offsetof(RetainLeaf, id));
+    out->index = static_cast<int32_t>(STRUCPP_RETAIN_FLASH_U32(l + offsetof(RetainLeaf, index)));
+    out->tag   = STRUCPP_RETAIN_FLASH_U8(l + offsetof(RetainLeaf, tag));
+    out->cap   = STRUCPP_RETAIN_FLASH_U8(l + offsetof(RetainLeaf, cap));
+#  undef STRUCPP_RETAIN_FLASH_U8
+#  undef STRUCPP_RETAIN_FLASH_U16
+#  undef STRUCPP_RETAIN_FLASH_U32
+#else
+    out->arr   = retain_vars[i].arr;
+    out->elem  = retain_vars[i].elem;
+    out->id    = retain_leaves[i].id;
+    out->index = retain_leaves[i].index;
+    out->tag   = retain_leaves[i].tag;
+    out->cap   = retain_leaves[i].cap;
+#endif
+    return true;
+}
+
+/**
+ * A STRING / WSTRING leaf's whole content into `dest` (at most `cap_bytes`):
+ * STRING as its characters, WSTRING as little-endian code units, two bytes
+ * each. Returns the bytes written; 0 for an empty string, an unknown leaf or
+ * any other type.
+ *
+ * NOT the debugger's wire form: read_string() caps at DEBUG_STRING_CAP (126)
+ * because that is the Modbus frame's budget. A retained value has no frame to
+ * fit, and a STRING(200) restored from its first 126 characters is not the
+ * value the variable had when it was stopped (IEC 61131-3 6.5.6.1 rule 1).
+ */
+inline uint16_t handle_read_text(uint8_t arr, uint16_t elem, uint8_t* dest,
+                                 uint16_t cap_bytes) noexcept {
+    Entry e = read_entry(arr, elem);
+    if (!e.ptr || !dest) return 0;
+    if (e.tag == TAG_STRING) {
+        const auto view = iec_string_view(e.ptr, debug_capacity(e.cap));
+        uint16_t n = *view.length;
+        if (n > cap_bytes) n = cap_bytes;
+        if (n > 0) std::memcpy(dest, view.data, n);
+        return n;
+    }
+    if (e.tag == TAG_WSTRING) {
+        const auto view = iec_wstring_view(e.ptr, debug_capacity(e.cap));
+        uint16_t units = *view.length;
+        if (units > cap_bytes / 2u) units = static_cast<uint16_t>(cap_bytes / 2u);
+        for (uint16_t i = 0; i < units; ++i) {
+            dest[i * 2u]      = static_cast<uint8_t>(view.data[i] & 0xFF);
+            dest[i * 2u + 1u] = static_cast<uint8_t>((view.data[i] >> 8) & 0xFF);
+        }
+        return static_cast<uint16_t>(units * 2u);
+    }
+    return 0;
+}
+
+/**
+ * Store `nbytes` of content into a STRING / WSTRING leaf (characters, or
+ * little-endian code units). A plain write, never a force, and a no-op while
+ * the variable is forced — exactly write_string()'s rule. Longer than the
+ * declared length: the leading characters are kept, which is what STruC++ does
+ * for any assignment of a longer string (IEC 61131-3 6.6.1.2.2, p.58, leaves
+ * that case Implementer specific).
+ *
+ * Returns STATUS_OK, STATUS_READ_ONLY for a CONSTANT, or STATUS_OUT_OF_BOUNDS
+ * for an unknown leaf or one that is not a string.
+ */
+inline uint8_t handle_write_text(uint8_t arr, uint16_t elem, const uint8_t* src,
+                                 uint16_t nbytes) noexcept {
+    Entry e = read_entry(arr, elem);
+    if (!e.ptr) return STATUS_OUT_OF_BOUNDS;
+    if (e.flags & LEAF_FLAG_READONLY) return STATUS_READ_ONLY;
+    if (e.tag == TAG_STRING) {
+        const auto view = iec_string_view(e.ptr, debug_capacity(e.cap));
+        if (*view.forced) return STATUS_OK;
+        iec_string_store(view.data, view.length, view.capacity,
+                         reinterpret_cast<const char*>(src), src ? nbytes : 0);
+        return STATUS_OK;
+    }
+    if (e.tag == TAG_WSTRING) {
+        const auto view = iec_wstring_view(e.ptr, debug_capacity(e.cap));
+        if (*view.forced) return STATUS_OK;
+        uint16_t units = src ? static_cast<uint16_t>(nbytes / 2u) : 0;
+        if (units > view.capacity) units = view.capacity;
+        for (uint16_t i = 0; i < units; ++i) {
+            view.data[i] = static_cast<char16_t>(
+                static_cast<uint16_t>(src[i * 2u]) |
+                static_cast<uint16_t>(static_cast<uint16_t>(src[i * 2u + 1u]) << 8));
+        }
+        view.data[units] = u'\0';
+        *view.length = units;
+        return STATUS_OK;
+    }
+    return STATUS_OUT_OF_BOUNDS;
+}
+
 
 /** Total number of arrays. */
 inline uint8_t handle_array_count() noexcept {
