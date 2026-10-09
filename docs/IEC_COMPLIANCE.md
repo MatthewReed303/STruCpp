@@ -27,7 +27,8 @@ STruC++ implements the Structured Text (ST) language from IEC 61131-3. This docu
 |------|--------|-------|
 | TYPE ... END_TYPE | Supported | Type aliases |
 | STRUCT ... END_STRUCT | Supported | With nested structs. An access path naming an element its type does not declare (`s.nosuch`, `arr[1].inner.nosuch`, `fb.nosuch`) is an error at the ST line (§6.4.4.6.1; Table 41 features 6a, 7) — for structures, local or from a library manifest, and user function blocks. A library block's members are not judged: its manifest omits what it inherits, its methods and its properties |
-| Enumerations | Supported | With optional base type |
+| Enumerations | Supported | §6.4.4.2, Table 11 feature 1: stored as INT. Compared only with a value of its own type; Table 38 admits SEL, MUX, EQ and NE, and a value of one is not converted to or from an integer in an assignment or a parameter (§6.6.1.6, Figure 11). `TO_*` yields its number. `<`, `>`, `<=` and `>=` between two values of one enumeration also compile, outside Table 38 |
+| Data types with named values | Supported | §6.4.4.3, Table 11 feature 2: `T : USINT (A := 0, B := 1) := B`. The base is an integer or bit-string type, and stored at its width; every value must fit it. Its values are values of the base type: a constant or calculation may be assigned (`x := 27`, `x := A + 1`), they compare and compute as the base, and convert implicitly as the base does (Figure 12) in assignments and input/output parameters, not in-outs. Standard functions other than SEL, MUX, EQ and NE (`ADD`, `MAX`, `LIMIT`, …) do not take one |
 | Initialized type declarations | Supported | A type may carry its own default (`Setpoint : REAL := 25.0;`, `Origin : Point := (x := 0.0);`), inherited by every declaration of the type that has no initializer |
 | ARRAY (1D) | Supported | Arbitrary bounds: ARRAY[1..10] OF INT |
 | ARRAY (2D) | Supported | ARRAY[1..3, 1..4] OF REAL |
@@ -122,6 +123,7 @@ STruC++ implements the Structured Text (ST) language from IEC 61131-3. This docu
 | Partial access | `var.0`, `var.%X0`, `var.%B1`, `var.%W0`, `var.%D1` | Supported — read and write. Also accepted on the integer types, which warns, as CODESYS's SA0148 does |
 | Typed literals | `INT#5`, `DINT#42`, `REAL#3.14` | Supported |
 | Integer literals | `9223372036854775807`, `16#FF`, `1_000` | Supported — the full 64-bit LINT/ULINT range is preserved exactly; a value wider than ULINT is rejected |
+| Duration literals | `T#14ms`, `TIME#1h_2m`, `LT#14.7s`, `T#-14ms`, `TIME#+2s` | Supported — a sign after the prefix applies to the whole duration (Table 8); `-T#14ms` is the same value |
 | NEW | `__NEW(type)`, `__NEW(type, size)` | Supported |
 | DELETE | `__DELETE(ptr)` | Supported |
 

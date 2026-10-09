@@ -494,18 +494,16 @@ inline void* resolve_indirect(const void* p) noexcept {
 #if defined(__AVR__)
     const uint8_t* r = static_cast<const uint8_t*>(p);
     const uintptr_t binding = pgm_read_word(r);
-    const uintptr_t base = pgm_read_word(r + sizeof(void*));
-    const uintptr_t leaf = pgm_read_word(r + 2 * sizeof(void*));
+    const uintptr_t offset = pgm_read_word(r + sizeof(void*));
     void* target = *reinterpret_cast<void* const*>(binding);
 #else
     const IndirectRef* r = static_cast<const IndirectRef*>(p);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(r->proto_base);
-    const uintptr_t leaf = reinterpret_cast<uintptr_t>(r->proto_leaf);
+    const uintptr_t offset = r->offset;
     void* target;
     std::memcpy(&target, r->binding, sizeof target);
 #endif
     if (!target) return nullptr;
-    return static_cast<uint8_t*>(target) + (leaf - base);
+    return static_cast<uint8_t*>(target) + offset;
 }
 
 inline Entry read_entry(uint8_t arr, uint16_t elem) noexcept {
@@ -607,6 +605,25 @@ inline uint8_t validate_payload(uint8_t tag, const uint8_t* bytes, uint16_t len)
     return STATUS_OK;
 }
 
+/**
+ * A LEAF_FLAG_RAW leaf (a bare array element) read or written in place, `n`
+ * bytes, the width of its tag. A BOOL is normalised, as force_impl<bool> does.
+ */
+inline void read_raw(uint8_t tag, const void* p, uint8_t* dest, uint8_t n) noexcept {
+    if (tag == TAG_BOOL) {
+        dest[0] = *static_cast<const uint8_t*>(p) != 0 ? 1 : 0;
+        return;
+    }
+    std::memcpy(dest, p, n);
+}
+inline void write_raw(uint8_t tag, void* p, const uint8_t* bytes, uint8_t n) noexcept {
+    if (tag == TAG_BOOL) {
+        *static_cast<bool*>(p) = bytes[0] != 0;
+        return;
+    }
+    std::memcpy(p, bytes, n);
+}
+
 /** Set (force or unforce) a variable. Returns STATUS_* code. */
 inline uint8_t handle_set(uint8_t arr, uint16_t elem, bool forcing,
                           const uint8_t* bytes, uint16_t len) noexcept {
@@ -617,6 +634,9 @@ inline uint8_t handle_set(uint8_t arr, uint16_t elem, bool forcing,
     // leaf that could never be forced is a no-op, and returning OK for it
     // would tell the caller a force had been cleared that never existed.
     if (e.flags & LEAF_FLAG_READONLY) return STATUS_READ_ONLY;
+
+    // A bare array element keeps no force state: nothing to force or clear.
+    if (e.flags & LEAF_FLAG_RAW) return forcing ? STATUS_READ_ONLY : STATUS_OK;
 
     if (forcing) {
         const uint8_t bad = validate_payload(e.tag, bytes, len);
@@ -635,6 +655,10 @@ inline uint16_t handle_read(uint8_t arr, uint16_t elem, uint8_t* dest) noexcept 
     if (!e.ptr || e.tag >= TAG__COUNT) return 0;
     uint8_t n = type_ops[e.tag].size;
     if (n == 0) return 0;  // tag with no width
+    if (e.flags & LEAF_FLAG_RAW) {
+        read_raw(e.tag, e.ptr, dest, n);
+        return n;
+    }
     type_ops[e.tag].read(e.ptr, dest, e.cap);
     return n;
 }
@@ -655,6 +679,10 @@ inline uint8_t handle_write(uint8_t arr, uint16_t elem,
     if (e.flags & LEAF_FLAG_READONLY) return STATUS_READ_ONLY;
     const uint8_t bad = validate_payload(e.tag, bytes, len);
     if (bad != STATUS_OK) return bad;
+    if (e.flags & LEAF_FLAG_RAW) {
+        write_raw(e.tag, e.ptr, bytes, type_ops[e.tag].size);
+        return STATUS_OK;
+    }
     type_ops[e.tag].write(e.ptr, bytes, e.cap);
     return STATUS_OK;
 }
@@ -684,6 +712,10 @@ inline const void* handle_ptr(uint8_t arr, uint16_t elem, uint16_t* out_len) noe
         return nullptr;
     }
     uint16_t len = 0;
+    if (e.flags & LEAF_FLAG_RAW) {
+        if (out_len) *out_len = type_ops[e.tag].size;
+        return e.ptr;
+    }
     const void* p = ptr_ops[e.tag].ptr(e.ptr, e.cap, &len);
     if (out_len) *out_len = len;
     return p;

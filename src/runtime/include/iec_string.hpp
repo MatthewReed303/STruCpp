@@ -65,6 +65,31 @@ public:
         data_[0] = '\0';
     }
 
+    /**
+     * An empty string with every character set: the form a constant
+     * expression needs (each member initialised). `blank()` and `literal()`
+     * use it only while a constant is evaluated, so a variable's initial value
+     * can be built at compile time; at run time they take the usual paths.
+     */
+    struct zero_fill {};
+    constexpr explicit IECString(zero_fill) noexcept : data_{}, length_(0) {}
+
+    /** An empty string: zero-filled in a constant expression, else as `IECString()`. */
+    static constexpr IECString blank() noexcept {
+        if (STRUCPP_CONSTANT_EVALUATED()) return IECString(zero_fill{});
+        return IECString();
+    }
+
+    /** A string from a literal: built in a constant expression, else as `IECString(str)`. */
+    static constexpr IECString literal(const char* str) noexcept {
+        if (STRUCPP_CONSTANT_EVALUATED()) {
+            IECString s(zero_fill{});
+            s.assign_constant(str);
+            return s;
+        }
+        return IECString(str);
+    }
+
     IECString(const char* str) noexcept : length_(0) {
         if (str) {
             size_t len = std::strlen(str);
@@ -92,7 +117,11 @@ public:
     IECString& operator=(const IECString&) = default;
     IECString& operator=(IECString&&) = default;
 
-    IECString& operator=(const char* str) noexcept {
+    constexpr IECString& operator=(const char* str) noexcept {
+        if (STRUCPP_CONSTANT_EVALUATED()) {
+            assign_constant(str);
+            return *this;
+        }
         if (str) {
             size_t len = std::strlen(str);
             length_ = static_cast<uint16_t>(len < MaxLen ? len : MaxLen);
@@ -347,6 +376,17 @@ public:
 private:
     char data_[MaxLen + 1];
     uint16_t length_;
+
+    /** `operator=(const char*)` as a constant expression can perform it. */
+    constexpr void assign_constant(const char* str) noexcept {
+        size_t n = 0;
+        while (str != nullptr && n < MaxLen && str[n] != '\0') {
+            data_[n] = str[n];
+            ++n;
+        }
+        length_ = static_cast<uint16_t>(n);
+        data_[n] = '\0';
+    }
 };
 
 using STRING = IECString<254>;
@@ -356,9 +396,12 @@ class IECStringVar {
 public:
     using value_type = IECString<MaxLen>;
 
-    IECStringVar() noexcept : value_{}, forced_{false}, forced_value_{} {}
-    IECStringVar(const value_type& v) noexcept : value_{v}, forced_{false}, forced_value_{} {}
-    IECStringVar(const char* str) noexcept : value_{str}, forced_{false}, forced_value_{} {}
+    constexpr IECStringVar() noexcept
+        : value_(value_type::blank()), forced_{false}, forced_value_(value_type::blank()) {}
+    constexpr IECStringVar(const value_type& v) noexcept
+        : value_{v}, forced_{false}, forced_value_(value_type::blank()) {}
+    constexpr IECStringVar(const char* str) noexcept
+        : value_(value_type::literal(str)), forced_{false}, forced_value_(value_type::blank()) {}
     /* Forcing semantics, matching IECVar (see iec_var.hpp).
      *
      * These cannot be `= default`. A memberwise copy carries `forced_` and
@@ -372,19 +415,19 @@ public:
      * Construction takes a detached snapshot of the effective value and starts
      * unforced; assignment routes through set() so the destination keeps its
      * own forcing state. */
-    IECStringVar(const IECStringVar& other) noexcept
+    constexpr IECStringVar(const IECStringVar& other) noexcept
         : value_{other.forced_ ? other.forced_value_ : other.value_},
           forced_{false},
-          forced_value_{} {}
-    IECStringVar(IECStringVar&& other) noexcept
+          forced_value_(value_type::blank()) {}
+    constexpr IECStringVar(IECStringVar&& other) noexcept
         : value_{other.forced_ ? other.forced_value_ : other.value_},
           forced_{false},
-          forced_value_{} {}
-    IECStringVar& operator=(const IECStringVar& other) noexcept {
+          forced_value_(value_type::blank()) {}
+    constexpr IECStringVar& operator=(const IECStringVar& other) noexcept {
         set(other.forced_ ? other.forced_value_ : other.value_);
         return *this;
     }
-    IECStringVar& operator=(IECStringVar&& other) noexcept {
+    constexpr IECStringVar& operator=(IECStringVar&& other) noexcept {
         set(other.forced_ ? other.forced_value_ : other.value_);
         return *this;
     }
@@ -425,7 +468,7 @@ public:
         return *this;
     }
 
-    value_type get() const noexcept {
+    constexpr value_type get() const noexcept {
         return forced_ ? forced_value_ : value_;
     }
 
@@ -433,11 +476,11 @@ public:
     // guard by name, and without it ordinary ST (`s := 'x'`) overwrote the raw
     // slot that read_string reports, so the debugger and the program disagreed
     // about a forced string.
-    void set(const value_type& v) noexcept {
+    constexpr void set(const value_type& v) noexcept {
         if (!forced_) { value_ = v; }
     }
 
-    void set(const char* str) noexcept {
+    constexpr void set(const char* str) noexcept {
         if (!forced_) { value_ = str; }
     }
 
@@ -473,12 +516,12 @@ public:
         return get();
     }
 
-    IECStringVar& operator=(const value_type& v) noexcept {
+    constexpr IECStringVar& operator=(const value_type& v) noexcept {
         set(v);
         return *this;
     }
 
-    IECStringVar& operator=(const char* str) noexcept {
+    constexpr IECStringVar& operator=(const char* str) noexcept {
         set(str);
         return *this;
     }

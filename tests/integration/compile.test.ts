@@ -627,9 +627,10 @@ describe('Error Handling Tests', () => {
       `;
       const result = compile(source);
       expect(result.success).toBe(true);
-      // copy-in, call and copy-out run as one step under the global's lock
+      // binding the global's own storage and the call run as one step under
+      // the global's lock
       expect(result.cppCode).toMatch(
-        /AX->with_lock\(\[&\]\(auto\* __glk\)\{\s*auto& __fbi = MV;\s*__fbi\.A = \(\*__glk\);\s*__fbi\(\);\s*__fbi\.ENO = true;\s*\(\*__glk\) = __fbi\.A;\s*\}\);/,
+        /AX->with_lock\(\[&\]\(auto\* __glk\)\{\s*auto& __fbi = MV;\s*auto\* (__iop\d+) = &\(\(\*__glk\)\);\n.*\n\s*strucpp::iec_inout_bind\(__fbi\.A, \*\1, (__ios\d+)\);\s*__fbi\(\);\s*__fbi\.ENO = true;\s*strucpp::iec_inout_back\(__fbi\.A, \*\1, \2\);\s*\}\);/,
       );
     });
 

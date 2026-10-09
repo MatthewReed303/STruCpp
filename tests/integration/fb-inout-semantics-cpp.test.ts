@@ -11,11 +11,14 @@
  * variable was passed to two in-outs and wrote `arr[i]` back to whichever
  * element `i` named after the call — both pinned below, now passing.
  *
- * Where a reference cannot be made the call still copies in and back: a bit of
- * a word (`w.3`), an actual of another declared length, and a shared global
- * (VAR_EXTERNAL), which the thread-safe globals copy in and back under its
- * lock. The debugger shows each in-out as a live, read-only view of the bound
- * variable (LEAF_FLAG_INDIRECT): forcing is done at the variable's own name.
+ * The member is the binding alone, one pointer. Where a reference cannot be
+ * made the CALL keeps the copy, beside it, and drops the binding after: a bit
+ * of a word (`w.3`), an actual of another declared length, and a shared global
+ * (VAR_EXTERNAL) the call cannot hold the lock of, copied in and stored back
+ * under its lock. A call made under a global's lock binds that global's own
+ * storage. The debugger shows each in-out as a live, read-only view of the
+ * bound variable (LEAF_FLAG_INDIRECT), addressed by the leaf's offset inside
+ * the in-out's type: forcing is done at the variable's own name.
  *
  * `strucpp --test` also emits in-outs now: its code generator used to skip the
  * FB parameter maps, so a TEST block saw none of a block's in-out writes.
@@ -415,7 +418,7 @@ int main() { g_config.INSTANCE0.run(); std::printf("%d\\n", (int)g_config.INSTAN
     const { result, out } = runWith(archive);
     expect(out).toBe("6");
     expect(result.cppCode).toMatch(
-      /strucpp::iec_inout_bind\(B\.IO, \*__io\d+\);/,
+      /strucpp::iec_inout_bind\(B\.IO, \*__io\d+, __ios\d+\);/,
     );
     const leaf = result.debugMap!.leaves.find(
       (l) => l.path === "INSTANCE0.B.IO",
@@ -441,3 +444,210 @@ int main() { g_config.INSTANCE0.run(); std::printf("%d\\n", (int)g_config.INSTAN
     expect(leaf?.indirect).toBeUndefined();
   });
 });
+
+/** Build `files` (generated code plus `main`) with g++, run it, return stdout. */
+const buildAndRun = (
+  result: ReturnType<typeof compile>,
+  main: string,
+): string => {
+  expect(result.errors.map((e) => e.message)).toEqual([]);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "strucpp-inout-slot-"));
+  try {
+    fs.writeFileSync(path.join(dir, "generated.hpp"), result.headerCode);
+    fs.writeFileSync(path.join(dir, "generated.cpp"), result.cppCode);
+    fs.writeFileSync(
+      path.join(dir, "generated_debug.cpp"),
+      result.debugTableCpp!,
+    );
+    fs.writeFileSync(path.join(dir, "main.cpp"), main);
+    const bin = path.join(dir, "run");
+    execSync(
+      `g++ -std=${CXX_STD} -Werror=invalid-offsetof -I"${RUNTIME_INCLUDE_PATH}" -I"${dir}" -o "${bin}" ` +
+        `"${path.join(dir, "main.cpp")}" "${path.join(dir, "generated.cpp")}" ` +
+        `"${path.join(dir, "generated_debug.cpp")}"`,
+      { encoding: "utf-8", env: cxxEnv },
+    );
+    return execSync(`"${bin}"`, { encoding: "utf-8" }).trim();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+/** `arr elem` of a debug-map leaf, as C++ arguments. */
+const leafArgs = (result: ReturnType<typeof compile>, p: string): string => {
+  const l = result.debugMap!.leaves.find((x) => x.path === p);
+  expect(l, p).toBeDefined();
+  return `${l!.arrayIdx}, ${l!.elemIdx}`;
+};
+
+describeIfGpp("an in-out member is a pointer; the call keeps any copy", () => {
+  const CFG = `
+CONFIGURATION Config0
+  VAR_GLOBAL g : Rec; g2 : INT; END_VAR
+  RESOURCE Res0 ON PLC
+    TASK task0(INTERVAL := T#20ms, PRIORITY := 0);
+    PROGRAM instance0 WITH task0 : Main;
+  END_RESOURCE
+END_CONFIGURATION`;
+  const TYPES = `
+TYPE Cell : STRUCT x : INT; tag : STRING(8); END_STRUCT; END_TYPE
+TYPE Rec : STRUCT
+  n : INT;
+  cells : ARRAY[1..3] OF Cell;
+  grid : ARRAY[1..2, 0..2] OF DINT;
+  flags : ARRAY[-1..1] OF BOOL;
+END_STRUCT; END_TYPE
+FUNCTION_BLOCK Touch
+  VAR_IN_OUT r : Rec; END_VAR
+  r.n := r.n + 1;
+  r.cells[2].x := r.cells[2].x + 10;
+  r.cells[3].tag := 'hello';
+  r.grid[2, 1] := r.grid[2, 1] + 100;
+  r.flags[-1] := TRUE;
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK Pair
+  VAR_IN_OUT a : INT; b : INT; END_VAR
+  a := a + 1;
+  b := b + 2;
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK SetBit
+  VAR_IN_OUT b : BOOL; END_VAR
+  b := TRUE;
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK Grow
+  VAR_IN_OUT s : STRING(20); END_VAR
+  s := CONCAT(s, 'xyz');
+END_FUNCTION_BLOCK
+`;
+
+  it("binds nested leaves, keeps a by-reference binding and drops a copy's", () => {
+    const result = compile(
+      `${TYPES}
+PROGRAM Main
+  VAR_EXTERNAL g : Rec; g2 : INT; END_VAR
+  VAR
+    t : Touch; local : Rec;
+    tg : Touch;
+    pr : Pair; v : INT;
+    sb : SetBit; w : WORD;
+    gr : Grow; s5 : STRING(5);
+    again : Pair;
+  END_VAR
+  t(r := local);
+  tg(r := g);             (* under g's lock, bound to g itself *)
+  pr(a := g2, b := g.n);  (* under g2's lock; g cannot be held: a copy *)
+  sb(b := w.3);           (* a bit: a copy beside the call *)
+  s5 := 'ab';
+  gr(s := s5);            (* another length: a copy beside the call *)
+  again(a := v, b := v);   (* one variable on two in-outs *)
+END_PROGRAM
+${CFG}`,
+      { headerFileName: "generated.hpp" },
+    );
+    const leaf = (p: string) => leafArgs(result, p);
+    const out = buildAndRun(
+      result,
+      `#include "generated.hpp"
+#include "debug_dispatch.hpp"
+#include <cstdio>
+#include <cstring>
+strucpp::Configuration_CONFIG0 g_config;
+using namespace strucpp::debug;
+static_assert(sizeof(strucpp::InOut<strucpp::REC>) == sizeof(void*), "an in-out is one pointer");
+template<typename T> int rd(uint8_t a, uint16_t e) { uint8_t b[64] = {0}; T v{}; uint16_t n = handle_read(a, e, b); std::memcpy(&v, b, sizeof v); return n ? (int)v : -1; }
+int main() {
+  auto& p = g_config.INSTANCE0;
+  p.run();
+  std::printf("local=%d,%d,%s,%d,%d ", (int)p.LOCAL.N, (int)p.LOCAL.CELLS[2].X,
+              p.LOCAL.CELLS[3].TAG.get().c_str(), (int)p.LOCAL.GRID(2, 1), (int)p.LOCAL.FLAGS[-1]);
+  std::printf("dbg=%d,%d,%d,%d ", (int)rd<int16_t>(${leaf("INSTANCE0.T.R.N")}),
+              (int)rd<int16_t>(${leaf("INSTANCE0.T.R.CELLS[2].X")}), (int)rd<int32_t>(${leaf("INSTANCE0.T.R.GRID[2][1]")}),
+              (int)rd<uint8_t>(${leaf("INSTANCE0.T.R.FLAGS[-1]")}));
+  uint16_t tagLen = 0; const char* tag = static_cast<const char*>(handle_ptr(${leaf("INSTANCE0.T.R.CELLS[3].TAG")}, &tagLen));
+  std::printf("tag=%.*s ", (int)tagLen, tag ? tag : "");
+  int16_t gn = strucpp::G.with_lock([](strucpp::REC* r) { return (int16_t)r->N; });
+  std::printf("g=%d,%d ", (int)gn, (int)rd<int16_t>(${leaf("INSTANCE0.TG.R.N")}));
+  std::printf("v=%d g2=%d pr=%d,%d ", (int)p.V, (int)strucpp::G2.with_lock([](strucpp::IEC_INT* x) { return (int)*x; }),
+              (int)rd<int16_t>(${leaf("INSTANCE0.PR.A")}), (int)rd<int16_t>(${leaf("INSTANCE0.PR.B")}));
+  std::printf("w=%u sb=%d s5=%s gr=%d ", (unsigned)p.W, (int)rd<uint8_t>(${leaf("INSTANCE0.SB.B")}), p.S5.get().c_str(),
+              p.GR.S.ref == nullptr);
+  std::printf("bound=%d,%d\\n", p.T.R.ref == &p.LOCAL, p.AGAIN.A.ref == &p.V);
+  return 0;
+}
+`,
+    );
+    // g.n: tg +1, pr +2; v: again +1+2 (both in-outs on v). TG.R and PR.A
+    // stay bound to the global itself; PR.B, SB.B and GR.S were the call's
+    // copies: unbound after it, so the debugger has no value for them.
+    expect(out).toBe(
+      "local=1,10,hello,100,1 dbg=1,10,100,1 tag=hello g=3,3 v=3 g2=1 pr=1,-1 w=8 sb=-1 s5=abxyz gr=1 bound=1,1",
+    );
+  });
+});
+
+describeIfGpp(
+  "code from a library built when in-outs held their own copy",
+  () => {
+    const compileSnippet = (body: string): { ok: boolean; out: string } => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "strucpp-inout-old-"));
+      try {
+        const file = path.join(dir, "old.cpp");
+        fs.writeFileSync(
+          file,
+          `#include "iec_var.hpp"
+#include <cstdio>
+using namespace strucpp;
+int main() {
+${body}
+  return 0;
+}
+`,
+        );
+        const bin = path.join(dir, "old");
+        try {
+          execSync(
+            `g++ -std=${CXX_STD} -I"${RUNTIME_INCLUDE_PATH}" -o "${bin}" "${file}" 2>&1`,
+            { encoding: "utf-8", env: cxxEnv },
+          );
+        } catch (e) {
+          return { ok: false, out: String((e as { stdout?: string }).stdout) };
+        }
+        return {
+          ok: true,
+          out: execSync(`"${bin}"`, { encoding: "utf-8" }).trim(),
+        };
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    it("still binds a same-type actual through the two-argument calls", () => {
+      const r = compileSnippet(`  InOut<IEC_INT> io; IEC_INT v = 5;
+  const bool copied = iec_inout_bind(io, v);
+  io.var() = io.var() + 1;
+  if (copied) iec_inout_back(io, v);
+  std::printf("%d %d\\n", (int)v, (int)copied);`);
+      expect(r).toEqual({ ok: true, out: "6 0" });
+    });
+
+    it("an unbound in-out a call relies on is the runtime error, not an access through null", () => {
+      // The analyzer has every call assign every in-out; require() is the
+      // check a call that did not would make.
+      const r = compileSnippet(`  InOut<IEC_INT> io; IEC_INT v = 1;
+  try { io.require(); std::printf("ran "); } catch (const std::runtime_error& e) { std::printf("fault "); }
+  io.bind(v); io.require(); std::printf("%d\\n", io.ref == &v);`);
+      expect(r).toEqual({ ok: true, out: "fault 1" });
+    });
+
+    it("refuses a copy-in at compile time, naming the fix", () => {
+      for (const body of [
+        `  InOut<IEC_DINT> io; IEC_INT v = 5; (void)iec_inout_bind(io, v);`,
+        `  InOut<IEC_INT> io; io = IEC_INT(3);`,
+      ]) {
+        const r = compileSnippet(body);
+        expect(r.ok).toBe(false);
+        expect(r.out).toContain("rebuild the library with this STruC++");
+      }
+    });
+  },
+);

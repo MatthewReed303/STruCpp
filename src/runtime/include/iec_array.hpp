@@ -57,11 +57,11 @@ private:
     
 public:
     // Default constructor - initializes all elements to default
-    IEC_ARRAY_1D() noexcept : data_{} {}
+    constexpr IEC_ARRAY_1D() noexcept : data_{} {}
     
     // Initializer list constructor
     template<typename U>
-    IEC_ARRAY_1D(std::initializer_list<U> init) noexcept : data_{} {
+    constexpr IEC_ARRAY_1D(std::initializer_list<U> init) noexcept : data_{} {
         size_t i = 0;
         for (const auto& val : init) {
             if (i >= size) break;
@@ -79,7 +79,7 @@ public:
     // Not ambiguous with the template for a scalar list: `{1, 2, 3}` deduces
     // `U = int` exactly, whereas this overload would need a user-defined
     // conversion per element, so the template wins.
-    IEC_ARRAY_1D(std::initializer_list<T> init) noexcept : data_{} {
+    constexpr IEC_ARRAY_1D(std::initializer_list<T> init) noexcept : data_{} {
         size_t i = 0;
         for (const auto& val : init) {
             if (i >= size) break;
@@ -157,6 +157,11 @@ public:
     static constexpr size_t elements_field_offset() noexcept {
         return offsetof(IEC_ARRAY_1D, data_);
     }
+    /** Byte offset of an element from the start of the array: the debugger
+     *  addresses a VAR_IN_OUT's leaves by offset (debug_table.hpp IndirectRef). */
+    static constexpr size_t element_offset(int64_t index) noexcept {
+        return elements_field_offset() + to_internal_index(index) * sizeof(var_type);
+    }
     static constexpr int64_t lower_bound(int = 1) noexcept { return Bounds::lower; }
     static constexpr int64_t upper_bound(int = 1) noexcept { return Bounds::upper; }
     
@@ -184,13 +189,13 @@ private:
     }
     
 public:
-    IEC_ARRAY_2D() noexcept : data_{} {}
+    constexpr IEC_ARRAY_2D() noexcept : data_{} {}
 
     // Flat (row-major) initializer-list constructor — mirrors IEC_ARRAY_1D.
     // ST aggregate inits for a 2D array (e.g. `ARRAY[1..20,0..1] OF REAL := [..]`)
     // codegen to a flat brace list; fill row-major, ignoring any overflow.
     template<typename U>
-    IEC_ARRAY_2D(std::initializer_list<U> init) noexcept : data_{} {
+    constexpr IEC_ARRAY_2D(std::initializer_list<U> init) noexcept : data_{} {
         size_t i = 0;
         for (const auto& val : init) {
             if (i >= total_size) break;
@@ -207,7 +212,7 @@ public:
     // leaves the rest of that row at its default instead of shifting the next
     // row up — which is the difference from writing the same values flat.
     template<typename U>
-    IEC_ARRAY_2D(std::initializer_list<std::initializer_list<U>> init) noexcept : data_{} {
+    constexpr IEC_ARRAY_2D(std::initializer_list<std::initializer_list<U>> init) noexcept : data_{} {
         size_t row = 0;
         for (const auto& rowInit : init) {
             if (row >= rows) break;
@@ -293,6 +298,11 @@ public:
     static constexpr size_t elements_field_offset() noexcept {
         return offsetof(IEC_ARRAY_2D, data_);
     }
+    /** Byte offset of an element from the start of the array: the debugger
+     *  addresses a VAR_IN_OUT's leaves by offset (debug_table.hpp IndirectRef). */
+    static constexpr size_t element_offset(int64_t i, int64_t j) noexcept {
+        return elements_field_offset() + to_linear_index(i, j) * sizeof(var_type);
+    }
 };
 
 // Multi-dimensional array (3D)
@@ -318,13 +328,13 @@ private:
     }
     
 public:
-    IEC_ARRAY_3D() noexcept : data_{} {}
+    constexpr IEC_ARRAY_3D() noexcept : data_{} {}
 
     // Flat (row-major) initializer-list constructor — mirrors IEC_ARRAY_1D/2D.
     // ST aggregate inits for a 3D array codegen to a flat brace list; fill
     // row-major, ignoring any overflow.
     template<typename U>
-    IEC_ARRAY_3D(std::initializer_list<U> init) noexcept : data_{} {
+    constexpr IEC_ARRAY_3D(std::initializer_list<U> init) noexcept : data_{} {
         size_t i = 0;
         for (const auto& val : init) {
             if (i >= total_size) break;
@@ -339,7 +349,7 @@ public:
     // Each level fills from its own lower bound, so a short inner list leaves
     // the remainder of that row at its default.
     template<typename U>
-    IEC_ARRAY_3D(
+    constexpr IEC_ARRAY_3D(
         std::initializer_list<std::initializer_list<std::initializer_list<U>>> init) noexcept
         : data_{} {
         size_t i = 0;
@@ -439,6 +449,11 @@ public:
      */
     static constexpr size_t elements_field_offset() noexcept {
         return offsetof(IEC_ARRAY_3D, data_);
+    }
+    /** Byte offset of an element from the start of the array: the debugger
+     *  addresses a VAR_IN_OUT's leaves by offset (debug_table.hpp IndirectRef). */
+    static constexpr size_t element_offset(int64_t i, int64_t j, int64_t k) noexcept {
+        return elements_field_offset() + to_linear_index(i, j, k) * sizeof(var_type);
     }
 };
 

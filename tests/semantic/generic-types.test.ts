@@ -414,7 +414,7 @@ END_VAR
 END_PROGRAM`;
     const cpp = compileSource(concrete).cppCode;
     expect(cpp).toMatch(
-      /auto\* (__io\d+) = &COUNT;\n\s*const bool __ioc\d+ = strucpp::iec_inout_bind\(B\.N, \*\1\);/,
+      /auto\* (__io\d+) = &COUNT;\n.*\n\s*strucpp::iec_inout_bind\(B\.N, \*\1, __ios\d+\);/,
     );
   });
 });

@@ -457,6 +457,10 @@ export function parseTimeLiteral(literal: string): TimeValue {
   // Remove the duration prefix (case insensitive): T, LT, TIME or LTIME.
   // LTIME shares TIME's nanosecond representation, so both parse the same.
   let value = literal.replace(/^(LTIME|LT|TIME|T)#/i, "");
+  // A signed duration (`T#-14ms`, IEC 61131-3 Ed.3 Table 8): the sign applies
+  // to the whole interval.
+  const negative = value.startsWith("-");
+  if (negative || value.startsWith("+")) value = value.slice(1);
 
   // Parse components: d (days), h (hours), m (minutes), s (seconds), ms (milliseconds), us (microseconds), ns (nanoseconds)
   const patterns = [
@@ -479,7 +483,7 @@ export function parseTimeLiteral(literal: string): TimeValue {
     }
   }
 
-  return { nanoseconds, rawValue };
+  return { nanoseconds: negative ? -nanoseconds : nanoseconds, rawValue };
 }
 
 // =============================================================================

@@ -138,6 +138,32 @@ function applyBlockFlags(
 const WALK_RETAINED_ONLY = 1 << 7;
 
 /**
+ * Walk-only flag, never emitted: the leaf is an array element of a declared
+ * type (an enumeration, alias or subrange), which C++ may store bare, without
+ * a forcing wrapper. The emitted flags then ask the C++ type (LEAF_FLAG_RAW).
+ */
+const WALK_RAW_CANDIDATE = 1 << 6;
+
+/**
+ * Walk-only flag, never emitted: the walk is inside storage a TYPE declares
+ * (a STRUCT's fields, a named ARRAY type's elements), which type-codegen.ts
+ * emits, rather than a POU's own variables, which codegen.ts emits. The two
+ * store an enumeration element differently: see `storedBare`.
+ */
+const WALK_IN_TYPE_DEF = 1 << 8;
+
+/**
+ * Walk-only flag, never emitted: `storedBare` expects the C++ element type of
+ * this raw candidate to be bare, so the debug map marks the leaf `raw`. The
+ * C++ table still takes LEAF_FLAG_RAW from the type itself (`leaf_raw_flag`);
+ * this is only the editor's copy of that answer.
+ */
+const WALK_RAW_EXPECTED = 1 << 9;
+
+/** The walk-only bits a STRUCT field or a block member never inherits. */
+const WALK_RAW_BITS = WALK_RAW_CANDIDATE | WALK_RAW_EXPECTED;
+
+/**
  * Mirrors `strucpp::retain::HEADER_SIZE` in runtime/include/iec_retain.hpp.
  * Changing one without the other makes the editor's capacity gate disagree
  * with the firmware's own arithmetic.
@@ -319,15 +345,63 @@ function flagsLiteral(flags: number): string {
 }
 
 /**
+ * An entry's flags byte: its LEAF_FLAG_* bits, plus LEAF_FLAG_RAW from the C++
+ * type of an array element that may be stored bare (see `rawCandidate`).
+ */
+function entryFlags(e: Entry, indirectType?: string): string {
+  const flags = flagsLiteral(e.flags);
+  if (e.rawCandidate !== true) return flags;
+  const type = indirectType ?? `decltype(${e.cppExpr})`;
+  return `static_cast<uint8_t>(${flags} | leaf_raw_flag<${type}>::value)`;
+}
+
+/**
  * Render an entry's `cap` byte. A string leaf whose length was not known here
  * (a constant's name, an archive without lengths) takes it from its C++ type,
  * so the runtime never addresses it with the 254 default.
  */
-function capLiteral(e: Entry): string {
+function capLiteral(e: Entry, indirectType?: string): string {
   if (e.cap === 0 && (e.tagName === "STRING" || e.tagName === "WSTRING")) {
-    return `string_cap<decltype(${e.cppExpr})>::value`;
+    return `string_cap<${indirectType ?? `decltype(${e.cppExpr})`}>::value`;
   }
   return String(e.cap);
+}
+
+/** Where a VAR_IN_OUT's leaves start: see `Entry.indirect`. */
+interface IndirectRoot {
+  binding: string;
+  root: string;
+  rootType: string;
+  typeKey: string;
+}
+
+/**
+ * One step of a leaf's access path below an in-out: a member, or an element
+ * (one index, or two or three for a 2-D / 3-D array, as
+ * `formatArrayElementAccess` writes them).
+ */
+type LeafStep = { field: string } | { index: string };
+
+/** `.NAME`, `[i]` and `(i, j[, k])` steps of a leaf's C++ access path. */
+function leafSteps(designator: string): LeafStep[] {
+  const steps: LeafStep[] = [];
+  const re =
+    /\.([A-Za-z_][A-Za-z0-9_]*)|\[(-?\d+)\]|\((-?\d+(?:, -?\d+){1,2})\)/y;
+  let at = 0;
+  while (at < designator.length) {
+    re.lastIndex = at;
+    const m = re.exec(designator);
+    if (!m) {
+      throw new Error(
+        `Internal error: in-out leaf path '${designator}' has a step the debug table cannot address`,
+      );
+    }
+    steps.push(
+      m[1] !== undefined ? { field: m[1] } : { index: (m[2] ?? m[3])! },
+    );
+    at = re.lastIndex;
+  }
+  return steps;
 }
 
 const TAG_NAME_BY_VALUE: Record<number, TagName> = Object.fromEntries(
@@ -455,6 +529,18 @@ export interface DebugLeaf {
    */
   indirect?: true;
   /**
+   * Present and `true` for a leaf C++ stores bare, without the forcing
+   * wrapper every other leaf has: an element of a POU's own
+   * `ARRAY OF <enumeration | alias | subrange>` (LEAF_FLAG_RAW in the table).
+   * The debugger reads and writes it in place, but it cannot be forced: the
+   * runtime refuses a force with STATUS_READ_ONLY, and releasing one is a
+   * no-op. Not `readOnly`, because a write still succeeds.
+   *
+   * Advisory and additive, like `readOnly`: it lets the editor hide the force
+   * control; the runtime enforces the refusal whatever the editor shows.
+   */
+  raw?: true;
+  /**
    * For an `indirect` leaf, the path of the variable it shows, when every
    * call of the instance binds the in-out to the same plain variable (no
    * computed index). Absent when the binding cannot be named statically: the
@@ -553,9 +639,10 @@ const DEFAULTS: Required<Omit<DebugTableGenOptions, "md5">> = {
 // ---------------------------------------------------------------------------
 
 interface Entry {
-  /** For a LEAF_FLAG_INDIRECT leaf: the in-out's binding (`InOut::ref`) and
-   *  its own copy (`InOut::copy`), which `cppExpr` is a leaf of. */
-  indirect?: { binding: string; proto: string };
+  /** For a LEAF_FLAG_INDIRECT leaf: the in-out's binding (`InOut::ref`), and
+   *  the in-out's root as `cppExpr` starts with it (`root`), the C++ type of
+   *  the in-out (`rootType`) and a key shared by in-outs of one type. */
+  indirect?: IndirectRoot;
   cppExpr: string;
   tagName: TagName;
   path: string;
@@ -563,6 +650,8 @@ interface Entry {
   size: number;
   /** Bitwise OR of LEAF_FLAG_*, emitted into the entry's `flags` byte. */
   flags: number;
+  /** An array element C++ may store bare: LEAF_FLAG_RAW comes from its type. */
+  rawCandidate?: true;
 
   /**
    * Declared capacity of a `STRING(n)` / `WSTRING(n)`; 0 for everything else and
@@ -668,18 +757,15 @@ export function generateDebugTable(
 
   // The value in-out being walked, if any: its leaves are INDIRECT. A stack,
   // because the walk is depth-first; an in-out's type holds no further in-out.
-  const indirectStack: Array<{
-    binding: string;
-    proto: string;
-    path: string;
-    target?: string;
-  }> = [];
+  const indirectStack: Array<IndirectRoot & { path: string; target?: string }> =
+    [];
+  let inoutRootCount = 0;
   const inoutTargets = computeInoutTargets(ast, projectModel, symbolTables);
 
   /**
    * Walk a function block's value VAR_IN_OUT `member` (an `InOut<V>`): its
    * leaves are the caller's variable, reached through the binding, so they are
-   * INDIRECT and READONLY, and addressed inside the block's own copy. An
+   * INDIRECT and READONLY, and addressed by their offset inside the type. An
    * in-out is never retained — IEC 61131-3 §6.5.6: RETAIN "may be used for
    * variables declared in static VAR, VAR_INPUT, VAR_OUTPUT, and VAR_GLOBAL
    * sections but not in VAR_IN_OUT section" — so a RETAIN instance's in-out
@@ -703,15 +789,25 @@ export function generateDebugTable(
     }
     if (flags & WALK_RETAINED_ONLY) return;
     const target = inoutTargets.get(path);
+    // The leaves' paths below the in-out are written after `root`, a marker
+    // rather than C++: the table addresses them by offset (renderCpp).
+    const root = `@inout${inoutRootCount++}`;
     indirectStack.push({
       binding: `${member}.ref`,
-      proto: `${member}.copy`,
+      root,
+      rootType: `std::remove_pointer<decltype(${member}.ref)>::type`,
+      // In-outs of one named type share their leaves' offsets; an inline
+      // ARRAY type is keyed by its own member.
+      typeKey:
+        typeRef.arrayDimensions === undefined
+          ? `${typeRef.name.toUpperCase()}(${typeRef.maxLength ?? ""})`
+          : root,
       path,
       ...(target !== undefined ? { target } : {}),
     });
     visitTypeRef(
       path,
-      `${member}.copy`,
+      root,
       typeRef,
       (flags & ~LEAF_FLAG_RETAIN) | LEAF_FLAG_READONLY | LEAF_FLAG_INDIRECT,
     );
@@ -753,6 +849,9 @@ export function generateDebugTable(
       if (!(flags & LEAF_FLAG_RETAIN)) return;
       flags &= ~WALK_RETAINED_ONLY;
     }
+    const rawCandidate = (flags & WALK_RAW_CANDIDATE) !== 0;
+    const rawExpected = rawCandidate && (flags & WALK_RAW_EXPECTED) !== 0;
+    flags &= ~(WALK_RAW_BITS | WALK_IN_TYPE_DEF);
     const tagName = IEC_NAME_TO_TAG[iecName.toUpperCase()];
     if (tagName === undefined) {
       skipped.push({ path, reason: `unknown elementary type: ${iecName}` });
@@ -779,8 +878,16 @@ export function generateDebugTable(
       flags,
       cap,
       ...(ind !== undefined
-        ? { indirect: { binding: ind.binding, proto: ind.proto } }
+        ? {
+            indirect: {
+              binding: ind.binding,
+              root: ind.root,
+              rootType: ind.rootType,
+              typeKey: ind.typeKey,
+            },
+          }
         : {}),
+      ...(rawCandidate ? { rawCandidate: true as const } : {}),
     };
     bucket.push(entry);
     leaves.push({
@@ -792,6 +899,7 @@ export function generateDebugTable(
       ...(flags & LEAF_FLAG_READONLY ? { readOnly: true as const } : {}),
       ...(flags & LEAF_FLAG_RETAIN ? { retain: true as const } : {}),
       ...(ind !== undefined ? { indirect: true as const } : {}),
+      ...(rawExpected ? { raw: true as const } : {}),
       ...(ind?.target !== undefined
         ? { target: ind.target + path.slice(ind.path.length) }
         : {}),
@@ -822,6 +930,55 @@ export function generateDebugTable(
       name = def.name;
     }
     return undefined;
+  };
+
+  /**
+   * Whether C++ stores an array element of the ST type `typeName` bare — the
+   * value itself, no forcing wrapper — which is what `leaf_raw_flag` finds in
+   * the C++ type. The debug map's `raw` comes from here; the table's
+   * LEAF_FLAG_RAW from the C++ type, so a slip here misleads only the editor.
+   *
+   * Mirrors the two emitters:
+   *   - codegen.ts `mapTypeRefToCpp`: a POU's own ARRAY holds any declared
+   *     TYPE by its own name, so an enumeration is the bare `enum class`;
+   *   - type-codegen.ts `mapStructFieldTypeToCpp` (a named ARRAY type, a STRUCT
+   *     field's ARRAY): an enumeration is the `IEC_<Name>` wrapper, anything
+   *     else declared is its own name;
+   * and in both an alias or a subrange is `using X = <base>`, which is bare
+   * unless the base is a class (a STRING, a STRUCT, an ARRAY, a block).
+   */
+  const storedBare = (
+    typeName: string,
+    inTypeDef: boolean,
+    viaAlias = false,
+    depth = 0,
+  ): boolean => {
+    const upper = typeName.toUpperCase();
+    if (IEC_NAME_TO_TAG[upper] !== undefined) {
+      // Named directly, an elementary element is the IEC_<T> wrapper; behind
+      // an alias it is the `<T>_t` value, a class only for the strings.
+      return viaAlias && upper !== "STRING" && upper !== "WSTRING";
+    }
+    const def = symbolTables.lookupType(upper)?.declaration?.definition;
+    if (def === undefined || depth > 32) return false;
+    switch (def.kind) {
+      case "EnumDefinition":
+        // `using Alias = Color;` is the bare enum wherever it is used.
+        return viaAlias || !inTypeDef;
+      case "SubrangeDefinition":
+        return true;
+      case "TypeReference":
+        if (
+          def.name.toUpperCase() === upper ||
+          def.arrayDimensions !== undefined ||
+          (def.referenceKind !== undefined && def.referenceKind !== "none")
+        ) {
+          return false;
+        }
+        return storedBare(def.name, inTypeDef, true, depth + 1);
+      default:
+        return false;
+    }
   };
 
   // visitTypeRef walks a TypeReference: elementary type → leaf, inline array
@@ -940,7 +1097,8 @@ export function generateDebugTable(
           dims as Array<{ start: number; end: number }>,
           0,
           def.elementType.name,
-          flags,
+          // type-codegen.ts emits a named ARRAY type's element type.
+          flags | WALK_IN_TYPE_DEF,
           [],
           def.elementType.maxLength,
         );
@@ -1025,6 +1183,8 @@ export function generateDebugTable(
     //     interface blocks. VAR_TEMP / VAR_EXTERNAL are excluded —
     //     those are not persistent state.
     const fbSym = symbolTables.lookupFunctionBlock(name);
+    // A block's members are never stored bare, and codegen.ts emits its class.
+    if (fbSym) flags &= ~(WALK_RAW_BITS | WALK_IN_TYPE_DEF);
     if (fbSym) {
       const interfaceVars = [
         ...fbSym.inputs,
@@ -1284,7 +1444,9 @@ export function generateDebugTable(
     // `flags` passes straight through: IEC puts CONSTANT on a var *block*, and
     // a STRUCT declares fields without blocks, so a struct field can never
     // introduce or clear the bit — it only inherits whatever the declaration
-    // that named the struct carried.
+    // that named the struct carried. A field is never stored bare, and
+    // type-codegen.ts emits the struct.
+    flags = (flags & ~WALK_RAW_BITS) | WALK_IN_TYPE_DEF;
     for (const fieldDecl of def.fields) {
       for (const fieldName of fieldDecl.names) {
         visitTypeRef(
@@ -1338,7 +1500,13 @@ export function generateDebugTable(
             ? { maxLength: elementMaxLength }
             : {}),
         } as TypeReference,
-        flags,
+        IEC_NAME_TO_TAG[elementTypeName.toUpperCase()] === undefined
+          ? (flags & ~WALK_RAW_EXPECTED) |
+              WALK_RAW_CANDIDATE |
+              (storedBare(elementTypeName, (flags & WALK_IN_TYPE_DEF) !== 0)
+                ? WALK_RAW_EXPECTED
+                : 0)
+          : flags & ~WALK_RAW_EXPECTED,
       );
       return;
     }
@@ -1878,20 +2046,77 @@ function renderCpp(
   lines.push("namespace strucpp { namespace debug {");
   lines.push("");
 
-  // VAR_IN_OUT leaves: where each one's binding is (see IndirectRef in
-  // debug_table.hpp). Before the entry arrays, which take their addresses.
+  // VAR_IN_OUT leaves: where each one's binding is and the leaf's offset in
+  // the in-out's type (see IndirectRef in debug_table.hpp). The offsets are
+  // `offsetof` chains, one constant per distinct leaf of each in-out type, so
+  // no object of the type is needed. Before the entry arrays, which take the
+  // IndirectRefs' addresses.
   const indirectIndex = new Map<Entry, number>();
+  const indirectType = new Map<Entry, string>();
   const indirectLines: string[] = [];
+  const offsetLines: string[] = [];
+  const offsetNodes = new Map<string, { type: string; offset: string }>();
+  const offsetNode = (
+    ind: IndirectRoot,
+    steps: LeafStep[],
+  ): { type: string; offset: string } => {
+    const key = `${ind.typeKey}\u0000${JSON.stringify(steps)}`;
+    const known = offsetNodes.get(key);
+    if (known) return known;
+    const n = offsetNodes.size;
+    let node: { type: string; offset: string };
+    if (steps.length === 0) {
+      node = { type: `__dioT${n}`, offset: `__dio${n}` };
+      offsetLines.push(`using ${node.type} = ${ind.rootType};`);
+      offsetLines.push(`constexpr uintptr_t ${node.offset} = 0;`);
+    } else {
+      const parent = offsetNode(ind, steps.slice(0, -1));
+      const step = steps[steps.length - 1]!;
+      const m = offsetNodes.size;
+      node = { type: `__dioT${m}`, offset: `__dio${m}` };
+      if ("field" in step) {
+        offsetLines.push(
+          `using ${node.type} = decltype(${parent.type}::${step.field});`,
+        );
+        offsetLines.push(
+          `constexpr uintptr_t ${node.offset} = ${parent.offset} + offsetof(${parent.type}, ${step.field});`,
+        );
+      } else {
+        offsetLines.push(`using ${node.type} = ${parent.type}::element_type;`);
+        offsetLines.push(
+          `constexpr uintptr_t ${node.offset} = ${parent.offset} + ${parent.type}::element_offset(${step.index});`,
+        );
+      }
+    }
+    offsetNodes.set(key, node);
+    return node;
+  };
   for (const bucket of arrays) {
     for (const e of bucket) {
       if (e.indirect === undefined) continue;
+      const node = offsetNode(
+        e.indirect,
+        leafSteps(e.cppExpr.slice(e.indirect.root.length)),
+      );
       indirectIndex.set(e, indirectLines.length);
+      indirectType.set(e, node.type);
       indirectLines.push(
-        `    { (const void*)&${e.indirect.binding}, (const void*)&${e.indirect.proto}, (const void*)&${e.cppExpr} },  // ${e.path}`,
+        `    { (const void*)&${e.indirect.binding}, ${node.offset} },  // ${e.path}`,
       );
     }
   }
   if (indirectLines.length > 0) {
+    // A STRUCT with an EXTENDS base is not standard-layout; `offsetof` of its
+    // members is still exact for a non-virtual base, which is all there is.
+    lines.push("#if defined(__GNUC__)");
+    lines.push("#pragma GCC diagnostic push");
+    lines.push('#pragma GCC diagnostic ignored "-Winvalid-offsetof"');
+    lines.push("#endif");
+    for (const line of offsetLines) lines.push(line);
+    lines.push("#if defined(__GNUC__)");
+    lines.push("#pragma GCC diagnostic pop");
+    lines.push("#endif");
+    lines.push("");
     lines.push(
       `const IndirectRef debug_indirect[${indirectLines.length}] STRUCPP_DEBUG_FLASH = {`,
     );
@@ -1916,8 +2141,8 @@ function renderCpp(
           // `static_cast` would refuse. The flags byte is what carries the
           // qualifier through to the runtime so the write paths can honour it.
           indirectIndex.has(e)
-            ? `    { (void*)&debug_indirect[${indirectIndex.get(e)}], TAG_${e.tagName}, ${flagsLiteral(e.flags)}, ${capLiteral(e)} },  // ${e.path} (in-out)`
-            : `    { (void*)&${e.cppExpr}, TAG_${e.tagName}, ${flagsLiteral(e.flags)}, ${capLiteral(e)} },  // ${e.path}`,
+            ? `    { (void*)&debug_indirect[${indirectIndex.get(e)}], TAG_${e.tagName}, ${entryFlags(e, indirectType.get(e))}, ${capLiteral(e, indirectType.get(e))} },  // ${e.path} (in-out)`
+            : `    { (void*)&${e.cppExpr}, TAG_${e.tagName}, ${entryFlags(e)}, ${capLiteral(e)} },  // ${e.path}`,
         );
       }
     }

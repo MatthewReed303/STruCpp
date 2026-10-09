@@ -156,6 +156,8 @@ export interface EnumValueSymbol extends BaseSymbol {
   kind: "enumValue";
   enumType: string;
   value: number;
+  /** Declared by a linked library: a project's own enumeration may reuse the name. */
+  fromLibrary?: true;
 }
 
 /**

@@ -151,7 +151,8 @@ describe('TypeCodeGenerator', () => {
       };
 
       const result = generator.generateTypes([type]);
-      expect(result).toContain('enum class TrafficLight');
+      // Stored as INT, the width of its debug leaf, on every target.
+      expect(result).toContain('enum class TrafficLight : INT_t {');
       expect(result).toContain('RED');
       expect(result).toContain('YELLOW');
       expect(result).toContain('GREEN');
@@ -177,7 +178,10 @@ describe('TypeCodeGenerator', () => {
       };
 
       const result = generator.generateTypes([type]);
-      expect(result).toContain('enum class State : INT_t');
+      // A data type with named values (IEC 61131-3 6.4.4.3): an unscoped enum,
+      // so its values convert to the base type, kept in a struct for its names.
+      expect(result).toContain('struct State__NAMED { enum State : INT_t {');
+      expect(result).toContain('using State = State__NAMED::State;');
       expect(result).toContain('IDLE = 0');
       expect(result).toContain('RUNNING = 1');
       expect(result).toContain('STOPPED = 2');

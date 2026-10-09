@@ -89,7 +89,7 @@ describe("value in-outs are bound by reference (IEC 61131-3 §3.48)", () => {
     expect(result.success).toBe(true);
     expect(result.headerCode ?? "").toContain("strucpp::InOut<IEC_INT> V;");
     expect(result.cppCode ?? "").toMatch(
-      /auto\* (__io\d+) = &N;\n\s*const bool __ioc\d+ = strucpp::iec_inout_bind\(B\.V, \*\1\);/,
+      /auto\* (__io\d+) = &N;\n.*\n\s*strucpp::iec_inout_bind\(B\.V, \*\1, __ios\d+\);/,
     );
     expect(result.cppCode ?? "").not.toContain("N = B.V;");
   });
@@ -105,7 +105,7 @@ describe("value in-outs are bound by reference (IEC 61131-3 §3.48)", () => {
     `);
     expect(result.success).toBe(true);
     expect(result.cppCode ?? "").toMatch(
-      /auto\* (__io\d+) = &Q;\n\s*const bool __ioc\d+ = strucpp::iec_inout_bind\(S\.P, \*\1\);/,
+      /auto\* (__io\d+) = &Q;\n.*\n\s*strucpp::iec_inout_bind\(S\.P, \*\1, __ios\d+\);/,
     );
     expect(result.cppCode ?? "").not.toContain("Q = S.P;");
   });
@@ -431,7 +431,7 @@ describe("an in-out supplied without a name", () => {
     const cpp = result.cppCode ?? "";
     expect(cpp).toContain("B.K = 3;");
     expect(cpp).toMatch(
-      /auto\* (__io\d+) = &N;\n\s*const bool __ioc\d+ = strucpp::iec_inout_bind\(B\.V, \*\1\);/,
+      /auto\* (__io\d+) = &N;\n.*\n\s*strucpp::iec_inout_bind\(B\.V, \*\1, __ios\d+\);/,
     );
   });
 });

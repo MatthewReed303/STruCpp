@@ -96,7 +96,7 @@ public:
     constexpr BaseType get() const noexcept { return value_; }
     
     // Assignment with optional range check
-    IEC_SUBRANGE_Value& operator=(BaseType val) noexcept {
+    constexpr IEC_SUBRANGE_Value& operator=(BaseType val) noexcept {
         #ifdef IEC_RANGE_CHECK
         value_ = in_range(val) ? val : clamp(val);
         #else
@@ -248,42 +248,42 @@ private:
     value_type forced_value_;
     
 public:
-    IEC_SUBRANGE_Var() noexcept : value_{}, forced_{false}, forced_value_{} {}
+    constexpr IEC_SUBRANGE_Var() noexcept : value_{}, forced_{false}, forced_value_{} {}
     
-    explicit IEC_SUBRANGE_Var(BaseType val) noexcept 
+    constexpr explicit IEC_SUBRANGE_Var(BaseType val) noexcept 
         : value_{val}, forced_{false}, forced_value_{} {}
     
-    explicit IEC_SUBRANGE_Var(value_type val) noexcept 
+    constexpr explicit IEC_SUBRANGE_Var(value_type val) noexcept 
         : value_{val}, forced_{false}, forced_value_{} {}
     
     // Same contract as IECVar, which debug_dispatch.hpp's force_impl/read_impl
     // reach this class through: a fresh instance starts unforced, and assigning
     // FROM another goes through set() so the destination's force survives.
-    IEC_SUBRANGE_Var(const IEC_SUBRANGE_Var& other) noexcept
+    constexpr IEC_SUBRANGE_Var(const IEC_SUBRANGE_Var& other) noexcept
         : value_{other.get()}, forced_{false}, forced_value_{} {}
-    IEC_SUBRANGE_Var(IEC_SUBRANGE_Var&& other) noexcept
+    constexpr IEC_SUBRANGE_Var(IEC_SUBRANGE_Var&& other) noexcept
         : value_{other.get()}, forced_{false}, forced_value_{} {}
-    IEC_SUBRANGE_Var& operator=(const IEC_SUBRANGE_Var& other) noexcept {
+    constexpr IEC_SUBRANGE_Var& operator=(const IEC_SUBRANGE_Var& other) noexcept {
         set(other.get());
         return *this;
     }
-    IEC_SUBRANGE_Var& operator=(IEC_SUBRANGE_Var&& other) noexcept {
+    constexpr IEC_SUBRANGE_Var& operator=(IEC_SUBRANGE_Var&& other) noexcept {
         set(other.get());
         return *this;
     }
     
     // Get current value (returns forced value if forced)
-    value_type get() const noexcept {
+    constexpr value_type get() const noexcept {
         return forced_ ? forced_value_ : value_;
     }
     
     // Ignored while forced, so a force stays authoritative against the
     // program's own writes — the same guard IECVar::set carries.
-    void set(value_type v) noexcept {
+    constexpr void set(value_type v) noexcept {
         if (!forced_) { value_ = v; }
     }
     
-    void set(BaseType v) noexcept {
+    constexpr void set(BaseType v) noexcept {
         if (!forced_) { value_ = v; }
     }
     
@@ -322,22 +322,22 @@ public:
     }
     
     // Implicit conversion to value_type
-    operator value_type() const noexcept {
+    constexpr operator value_type() const noexcept {
         return get();
     }
     
     // Implicit conversion to base_type
-    operator BaseType() const noexcept {
+    constexpr operator BaseType() const noexcept {
         return get().get();
     }
     
     // Assignment operators
-    IEC_SUBRANGE_Var& operator=(value_type v) noexcept {
+    constexpr IEC_SUBRANGE_Var& operator=(value_type v) noexcept {
         set(v);
         return *this;
     }
     
-    IEC_SUBRANGE_Var& operator=(BaseType v) noexcept {
+    constexpr IEC_SUBRANGE_Var& operator=(BaseType v) noexcept {
         set(v);
         return *this;
     }

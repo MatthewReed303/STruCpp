@@ -58,7 +58,7 @@ public:
  *       [](POINT& v0) { v0.Y = 2.0; v0.X = 1.0; });
  */
 template <typename T, typename Setter>
-inline T iec_struct_init(Setter&& setter) {
+constexpr T iec_struct_init(Setter&& setter) {
     T value{};
     setter(value);
     return value;

@@ -328,15 +328,38 @@ export function registerLibrarySymbols(
   manifest: LibraryManifest,
   symbolTables: SymbolTables,
 ): void {
+  // An enumeration this library (or one registered before it) declares, so a
+  // function returning one returns that enumeration rather than an
+  // unresolved name that nothing is assignable to.
+  const enumsHere = new Map(
+    manifest.types
+      .filter((t) => t.kind === "enum")
+      .map((t) => [t.name.toUpperCase(), t]),
+  );
+  const libraryEnum = (name: string): EnumType | undefined => {
+    const known = symbolTables.lookupType(name)?.resolvedType;
+    if (known?.typeKind === "enum") return known as EnumType;
+    const t = enumsHere.get(name.toUpperCase());
+    if (t === undefined) return undefined;
+    return {
+      typeKind: "enum",
+      name: t.name,
+      values: [...(t.members ?? [])],
+      ...(t.baseType !== undefined ? { baseType: t.baseType } : {}),
+    } as EnumType;
+  };
+
   // Register functions
   for (const fn of manifest.functions) {
-    const returnType: ElementaryType = ELEMENTARY_TYPES[
-      fn.returnType.toUpperCase()
-    ] ?? {
+    const unresolved: ElementaryType = {
       typeKind: "elementary",
       name: fn.returnType,
       sizeBits: 0,
     };
+    const returnType: IECType =
+      ELEMENTARY_TYPES[fn.returnType.toUpperCase()] ??
+      libraryEnum(fn.returnType) ??
+      unresolved;
 
     try {
       symbolTables.globalScope.define({
@@ -352,16 +375,17 @@ export function registerLibrarySymbols(
             name: fn.returnType,
             isReference: false,
             referenceKind: "none",
+            ...(typeof fn.returnMaxLength === "number"
+              ? { maxLength: fn.returnMaxLength }
+              : {}),
           },
           varBlocks: [],
           body: [],
         },
         returnType,
         parameters: fn.parameters.map((p) => {
-          const sym = makeVarSymbol(
-            { name: p.name, type: p.type },
-            p.direction,
-          );
+          const { direction, ...varType } = p;
+          const sym = makeVarSymbol(varType, direction);
           // Carry the optional-input marker: a parameter with an initial value
           // is optional at the call site (see Option A in the analyzer).
           if (p.initialValue !== undefined) sym.initialValue = p.initialValue;
@@ -399,13 +423,39 @@ export function registerLibrarySymbols(
                 name: member,
                 sourceSpan: createDefaultSourceSpan(),
               })),
+              // A data type with named values is debugged at its base's width.
+              ...(t.baseType !== undefined
+                ? {
+                    baseType: {
+                      kind: "TypeReference" as const,
+                      sourceSpan: createDefaultSourceSpan(),
+                      name: t.baseType,
+                      isReference: false,
+                      referenceKind: "none" as const,
+                    },
+                  }
+                : {}),
             },
           },
           resolvedType: {
             typeKind: "enum",
             name: t.name,
             values: [...(t.members ?? [])],
+            ...(t.baseType !== undefined ? { baseType: t.baseType } : {}),
           } as EnumType,
+        });
+        // Each member as a bare enumerated value, as a project's own
+        // enumeration declares them, so `UT_STOP_FULL` is typed UT_STOP
+        // wherever it appears (a generic function's argument included).
+        (t.members ?? []).forEach((member, index) => {
+          if (symbolTables.globalScope.hasLocal(member)) return;
+          symbolTables.globalScope.define({
+            name: member,
+            kind: "enumValue",
+            enumType: t.name,
+            value: index,
+            fromLibrary: true,
+          });
         });
       } catch (e) {
         if (!(e instanceof DuplicateSymbolError)) throw e;

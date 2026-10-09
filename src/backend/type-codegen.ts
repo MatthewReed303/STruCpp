@@ -66,6 +66,8 @@ export interface TypeCodeGenOptions {
   isUserDefinedType: (typeName: string) => boolean;
   /** Library STRUCTs with a layout table, which a struct here may nest. */
   externalStructs?: readonly import("./type-descriptor-gen.js").ExternalStruct[];
+  /** Enumerated types a library declares, which a struct here may hold. */
+  externalEnums?: readonly string[];
 }
 
 /**
@@ -211,6 +213,10 @@ export class TypeCodeGenerator {
   }> = [];
   /** Reverse map: enum member name (upper case) → owning enum type */
   private enumMemberToType: Map<string, EnumMemberEntry> = new Map();
+  /** Set while an enumeration's member values are emitted: its own members
+   *  (upper case), named bare inside the enum body, where the type's name is
+   *  not yet declared. Their arithmetic is integer, so AND/OR/XOR are bitwise. */
+  private enumValueMembers: Set<string> | undefined;
 
   /**
    * Hooks for structure-initializer lowering (a STRUCT element whose own default
@@ -248,10 +254,15 @@ export class TypeCodeGenerator {
    */
   generateTypes(types: TypeDeclaration[]): string {
     this.output = [];
-    this.knownEnumNames = new Set();
+    // A library's enumerations too: a field of one must be the forceable
+    // `IEC_<Name>` wrapper the debugger addresses, not the bare C++ enum.
+    this.knownEnumNames = new Set(
+      (this.options.externalEnums ?? []).map((n) => n.toUpperCase()),
+    );
     this.descriptors = new TypeDescriptorGenerator({
       types,
       externalStructs: this.options.externalStructs ?? [],
+      externalEnums: this.options.externalEnums ?? [],
       mapStructFieldTypeToCpp: (
         name: string,
         maxLength?: number | string,
@@ -483,30 +494,41 @@ export class TypeCodeGenerator {
   /**
    * Generate an enum type definition
    *
-   * Simple enum:
+   * Enumeration (IEC 61131-3 Ed.3 6.4.4.2), a scoped enum on INT so its
+   * storage matches the INT debug leaf on every target:
    *   TrafficLight : (RED, YELLOW, GREEN);
-   * C++:
-   *   enum class TrafficLight { RED, YELLOW, GREEN };
+   *   enum class TrafficLight : INT_t { RED, YELLOW, GREEN };
    *
-   * Typed enum with explicit values:
-   *   State : INT (IDLE := 0, RUNNING := 1, STOPPED := 2);
-   * C++:
-   *   enum class State : INT_t { IDLE = 0, RUNNING = 1, STOPPED = 2 };
+   * Data type with named values (6.4.4.3), whose values are values of the base
+   * type, so an unscoped enum (it converts to the base integer) kept in a
+   * struct so its names stay qualified:
+   *   State : USINT (IDLE := 0, RUNNING := 1);
+   *   struct State__NAMED { enum State : USINT_t { IDLE = 0, RUNNING = 1 }; };
+   *   using State = State__NAMED::State;
    */
   private generateEnumType(name: string, def: EnumDefinition): void {
-    const baseType = def.baseType
-      ? ` : ${this.mapTypeToCpp(def.baseType.name)}`
-      : "";
-
+    const own = new Set(def.members.map((m) => m.name.toUpperCase()));
     const members = def.members.map((member) => {
       if (member.value) {
-        const val = this.expressionToCpp(member.value);
-        return `${member.name} = ${val}`;
+        this.enumValueMembers = own;
+        try {
+          return `${member.name} = ${this.expressionToCpp(member.value)}`;
+        } finally {
+          this.enumValueMembers = undefined;
+        }
       }
       return member.name;
     });
 
-    this.emit(`enum class ${name}${baseType} { ${members.join(", ")} };`);
+    if (def.baseType) {
+      const base = this.mapTypeToCpp(def.baseType.name);
+      this.emit(
+        `struct ${name}__NAMED { enum ${name} : ${base} { ${members.join(", ")} }; };`,
+      );
+      this.emit(`using ${name} = ${name}__NAMED::${name};`);
+    } else {
+      this.emit(`enum class ${name} : INT_t { ${members.join(", ")} };`);
+    }
     this.emit("");
   }
 
@@ -759,6 +781,14 @@ export class TypeCodeGenerator {
     let result = expr.name;
     const nameUpper = expr.name.toUpperCase();
 
+    if (
+      this.enumValueMembers?.has(nameUpper) === true &&
+      expr.fieldAccess.length === 0 &&
+      expr.subscripts.length === 0
+    ) {
+      return expr.name;
+    }
+
     // Bare enum member: Stopped → Irrigation_State::Stopped
     const enumEntry = this.enumMemberToType.get(nameUpper);
     if (enumEntry?.typeName && expr.fieldAccess.length === 0) {
@@ -807,6 +837,10 @@ export class TypeCodeGenerator {
       ">=": ">=",
     };
 
+    if (this.enumValueMembers) {
+      opMap.AND = "&";
+      opMap.OR = "|";
+    }
     const cppOp = opMap[expr.operator] ?? expr.operator;
     return `${left} ${cppOp} ${right}`;
   }
@@ -815,7 +849,7 @@ export class TypeCodeGenerator {
     const operand = this.expressionToCpp(expr.operand);
 
     const opMap: Record<string, string> = {
-      NOT: "!",
+      NOT: this.enumValueMembers ? "~" : "!",
       "-": "-",
       "+": "+",
     };

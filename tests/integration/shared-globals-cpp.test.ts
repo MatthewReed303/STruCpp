@@ -542,10 +542,10 @@ int main() {
     expect(result.cppCode).toMatch(
       /DEV->with_lock\(\[&\]\(auto\* __glk\)\{\s*auto& __fbi = ALL;\s*__fbi\.ARR = \(\*__glk\)\.PUMPS;\s*__fbi\(\);/,
     );
-    // A value in-out is copied in and back inside the one lock, and an input
-    // read from the same global is read inside it too.
+    // A value in-out is bound to the global's own storage inside the one lock
+    // (no copy), and an input read from the same global is read inside it too.
     expect(result.cppCode).toMatch(
-      /__fbi\.DATA = \(\*__glk\)\.STN;\s*__fbi\.SEEN = \(\*__glk\)\.LAST;\s*__fbi\(\);\s*__fbi\.ENO = true;\s*\(\*__glk\)\.STN = __fbi\.DATA;/,
+      /__fbi\.SEEN = \(\*__glk\)\.LAST;\s*auto\* (__iop\d+) = &\(\(\*__glk\)\.STN\);\s*strucpp::inout_slot_t<decltype\(BUMPSTATION::DATA\), decltype\(\*\1\)> (__ios\d+);\s*strucpp::iec_inout_bind\(__fbi\.DATA, \*\1, \2\);\s*__fbi\(\);\s*__fbi\.ENO = true;\s*strucpp::iec_inout_back\(__fbi\.DATA, \*\1, \2\);\s*\}\);/,
     );
     // A function binds its in-out to the global under the global's lock; an
     // input reading another global is read before it.

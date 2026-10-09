@@ -27,21 +27,24 @@ export interface LibraryFunctionEntry {
   name: string;
   /** Return type name (concrete IEC type or generic — see above) */
   returnType: string;
-  /** Parameter list */
-  parameters: Array<{
-    name: string;
-    type: string;
-    direction: "input" | "output" | "inout";
-    /** Initial (default) value of the parameter, as an ST expression string
-     *  (e.g. "255", "10.0", "T#100ms"). Present only for inputs declared with
-     *  an initial value. Semantics: an input WITH an `initialValue` is
-     *  OPTIONAL at the call site (the compiler supplies the default when the
-     *  argument is omitted); an input WITHOUT one is MANDATORY (omitting it is
-     *  a compile error). Captured by the library compiler from VAR_INPUT
-     *  initial values in the source ST — including ST produced by the CODESYS
-     *  v2/v3 importers, which preserve declarations verbatim. */
-    initialValue?: string;
-  }>;
+  /** Declared length of a `STRING(n)` / `WSTRING(n)` return type. */
+  returnMaxLength?: number;
+  /** Parameter list: the VAR_INPUT, VAR_OUTPUT and VAR_IN_OUT variables, each
+   *  described as a function block's are (STRING lengths, array bounds). */
+  parameters: Array<
+    Omit<LibraryVarType, "initialValue"> & {
+      direction: "input" | "output" | "inout";
+      /** Initial (default) value of the parameter, as an ST expression string
+       *  (e.g. "255", "10.0", "T#100ms"). Present only for inputs declared with
+       *  an initial value. Semantics: an input WITH an `initialValue` is
+       *  OPTIONAL at the call site (the compiler supplies the default when the
+       *  argument is omitted); an input WITHOUT one is MANDATORY (omitting it is
+       *  a compile error). Captured by the library compiler from VAR_INPUT
+       *  initial values in the source ST — including ST produced by the CODESYS
+       *  v2/v3 importers, which preserve declarations verbatim. */
+      initialValue?: string;
+    }
+  >;
   /** Variadic call shape. When set, `parameters` describes the leading
    *  required parameters and the function accepts any number of
    *  additional arguments matching the LAST parameter's type. `minArgs`
@@ -151,6 +154,11 @@ export interface LibraryFBEntry {
    * every STruC++ that binds them; an archive without it was built when the
    * block held a copy (plain members), and a consumer calls its blocks the
    * old way — copy in, copy back — and debugs the copy.
+   *
+   * The member is the binding alone; where a call needs a copy, the call
+   * keeps it. An archive from a STruC++ whose `InOut` also held a copy still
+   * builds, unless its own code copies into an in-out: that is refused when
+   * the code is compiled, naming the rebuild (iec_var.hpp).
    */
   inoutsByReference?: boolean;
   /**

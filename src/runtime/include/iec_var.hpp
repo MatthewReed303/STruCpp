@@ -43,8 +43,12 @@
 #pragma once
 
 #include "iec_types.hpp"
+#include "iec_fault.hpp"
 #include <type_traits>
 #include <utility>
+#if STRUCPP_HAS_EXCEPTIONS
+#include <stdexcept>
+#endif
 
 /**
  * Calling form of the variable accessors (IECVar / IEC_ENUM_Var get and set)
@@ -98,10 +102,10 @@ public:
     // =========================================================================
 
     /** Default constructor - initializes to zero/false */
-    IECVar() noexcept : value_{}, forced_{false}, forced_value_{} {}
+    constexpr IECVar() noexcept : value_{}, forced_{false}, forced_value_{} {}
 
     /** Construct with initial value (non-explicit to allow IEC_INT val = 10 syntax) */
-    IECVar(T v) noexcept : value_{v}, forced_{false}, forced_value_{} {}
+    constexpr IECVar(T v) noexcept : value_{v}, forced_{false}, forced_value_{} {}
 
     /** Cross-type converting constructor: IECVar<SINT_t> → IECVar<INT_t> etc.
      *  Enables implicit widening when struct fields (now IECVar-wrapped) are passed
@@ -109,15 +113,15 @@ public:
      *  two user-defined conversions (IECVar<U>→U→T→IECVar<T>) which is disallowed. */
     template<typename U, std::enable_if_t<
         std::is_convertible<U, T>::value && !std::is_same<U, T>::value, int> = 0>
-    IECVar(const IECVar<U>& other) noexcept
+    constexpr IECVar(const IECVar<U>& other) noexcept
         : value_{static_cast<T>(other.get())}, forced_{false}, forced_value_{} {}
 
     /** Copy constructor — fresh IECVar starts unforced regardless of source. */
-    IECVar(const IECVar& other) noexcept
+    constexpr IECVar(const IECVar& other) noexcept
         : value_{other.get()}, forced_{false}, forced_value_{} {}
 
     /** Move constructor — same semantics as copy. */
-    IECVar(IECVar&& other) noexcept
+    constexpr IECVar(IECVar&& other) noexcept
         : value_{other.get()}, forced_{false}, forced_value_{} {}
 
     /**
@@ -129,13 +133,13 @@ public:
      * that the debugger is holding — precisely what generated PLC code
      * does every scan cycle with `BLINK := TOF0.Q`.
      */
-    IECVar& operator=(const IECVar& other) noexcept {
+    constexpr IECVar& operator=(const IECVar& other) noexcept {
         set(other.get());
         return *this;
     }
 
     /** Move assignment — same semantics as copy. */
-    IECVar& operator=(IECVar&& other) noexcept {
+    constexpr IECVar& operator=(IECVar&& other) noexcept {
         set(other.get());
         return *this;
     }
@@ -148,7 +152,7 @@ public:
      * Get the current value.
      * Returns the forced value if forcing is active, otherwise the normal value.
      */
-    STRUCPP_ACCESSOR T get() const noexcept {
+    STRUCPP_ACCESSOR constexpr T get() const noexcept {
         return forced_ ? forced_value_ : value_;
     }
 
@@ -157,7 +161,7 @@ public:
      * If forcing is active, the set is ignored to ensure drivers reading
      * the raw storage always see the forced value for output variables.
      */
-    STRUCPP_ACCESSOR void set(T v) noexcept {
+    STRUCPP_ACCESSOR constexpr void set(T v) noexcept {
         if (!forced_) {
             value_ = v;
         }
@@ -247,12 +251,12 @@ public:
     // =========================================================================
 
     /** Implicit conversion to underlying type for natural syntax */
-    operator T() const noexcept {
+    constexpr operator T() const noexcept {
         return get();
     }
 
     /** Assignment from raw value */
-    IECVar& operator=(T v) noexcept {
+    constexpr IECVar& operator=(T v) noexcept {
         set(v);
         return *this;
     }
@@ -263,7 +267,7 @@ public:
      *  that each require one user-defined conversion). */
     template<typename U, std::enable_if_t<
         std::is_convertible<U, T>::value && !std::is_same<U, T>::value, int> = 0>
-    IECVar& operator=(const IECVar<U>& other) noexcept {
+    constexpr IECVar& operator=(const IECVar<U>& other) noexcept {
         set(static_cast<T>(other.get()));
         return *this;
     }
@@ -619,41 +623,60 @@ using IEC_LONG_DATE_AND_TIME = IEC_LDT;
  * variable itself (§6.6.2.2 rule 6, Figure 13 NOTE 3), and the binding is
  * stored in the instance between calls (§6.6.3.4.1: "the instance shall be
  * provided with a valid value which is stored, e.g. via initialization or
- * former call"). The instance used to hold a COPY, copied in before the call
- * and back after it: two in-outs bound to one variable lost a write, and an
- * element `arr[i]` was written back to whichever element `i` named after the
- * call.
+ * former call, before used in the function block (body) ... otherwise it
+ * causes a runtime error").
  *
- * `ref` points at the caller's own wrapper (IECVar, struct, string, array), so
- * reads go through get() and writes through set(): a forced variable reads its
- * forced value and keeps it, exactly as before. `copy` is the block's own
- * storage, used where a reference cannot be made — a bit of a word, an actual
- * of another type (STRING(10) on a STRING(20) in-out) — or where the call is
- * copied in and back on purpose (a shared global, whose lock the call cannot
- * hold); `ref` then points at `copy`. `copy` is first, so an older reader that
- * takes the member's own address sees a valid value of the declared type.
+ * The member is the binding alone, one pointer: `ref` points at the caller's
+ * own wrapper (IECVar, struct, string, array), so reads go through get() and
+ * writes through set() and a forced variable keeps its forced value. Where a
+ * reference cannot be made — a bit of a word, an actual of another type
+ * (STRING(10) on a STRING(20) in-out), a shared global the call cannot hold
+ * the lock of — the CALL provides the copy (`InOutSlot` or a temporary beside
+ * the call), binds it, copies it back and unbinds. Unbound, `ref` is null: the
+ * debugger shows no value, and a call that leaves the in-out out raises the
+ * runtime error (`require()`).
  */
 template<typename V>
 class InOut {
 public:
-    InOut() noexcept : copy(), ref(&copy) {}
-    InOut(const InOut& other) noexcept : copy(other.var()), ref(&copy) {}
+    using value_type = V;
 
-    /** A copied-in value (the copy-in / copy-back form). */
-    InOut& operator=(const InOut& other) noexcept {
-        copy = other.var();
-        ref = &copy;
-        return *this;
-    }
+    InOut() noexcept : ref(nullptr) {}
+    /** A copy of an instance keeps its binding (§6.6.3.4.1). */
+    InOut(const InOut& other) noexcept = default;
+    InOut& operator=(const InOut& other) noexcept = default;
+
+    /**
+     * Copying a value INTO the member was the copy-in form of a STruC++ whose
+     * in-outs held their own copy. Only code generated by that STruC++ (a
+     * library built with it) still does it.
+     */
     template<typename A>
-    InOut& operator=(const A& value) noexcept {
-        copy = value;
-        ref = &copy;
+    InOut& operator=(const A&) noexcept {
+        static_assert(sizeof(A) == 0,
+            "VAR_IN_OUT copy-in from code generated by an older STruC++ "
+            "(in-outs held their own copy): rebuild the library with this STruC++");
         return *this;
     }
 
     /** Bind the caller's variable itself. */
     void bind(V& actual) noexcept { ref = &actual; }
+    /** Drop a binding whose target does not outlive the call (a call's copy). */
+    void unbind() noexcept { ref = nullptr; }
+
+    /**
+     * A call that leaves the in-out out works on the stored binding; with none,
+     * that is the runtime error §6.6.3.4.1 names (a null reference fault).
+     */
+    void require() const {
+        if (ref == nullptr) {
+#if STRUCPP_HAS_EXCEPTIONS
+            throw std::runtime_error("VAR_IN_OUT used before it was bound");
+#else
+            iec_runtime_fault(IecFault::NullReference, "VAR_IN_OUT not bound");
+#endif
+        }
+    }
 
     V& var() noexcept { return *ref; }
     const V& var() const noexcept { return *ref; }
@@ -662,22 +685,62 @@ public:
 
     /**
      * C++ written against the member directly (a C/C++ block's `{external}`
-     * glue: `vars.IO = &IO;`, `&IO[lower] - lower`) reaches the bound variable,
-     * as it reached the member when the member was the variable's copy.
+     * glue: `vars.IO = &IO;`, `&IO[lower] - lower`) reaches the bound variable.
      */
     V* operator&() noexcept { return ref; }
     const V* operator&() const noexcept { return ref; }
     template<typename I>
     auto operator[](I i) noexcept -> decltype((*std::declval<V*>())[i]) { return (*ref)[i]; }
 
-    V copy;   ///< The block's own storage (copy form, and the unbound default)
-    V* ref;   ///< The variable the block works on
+    V* ref;   ///< The variable the block works on; null while unbound
 };
 
+/** The declared type of an in-out member (`decltype(fb.IO)`). */
+template<typename IO>
+using inout_value_t = typename std::remove_reference<IO>::type::value_type;
+
 /**
- * Bind an in-out to the caller's variable before the call. A variable of the
- * in-out's own type is bound by reference (returns false: nothing to copy
- * back); anything else is copied in (returns true: copy it back after).
+ * The call's own copy of an in-out's actual, where the actual is of another
+ * type than the in-out and cannot be bound: empty when it is the same type.
+ * Declared beside the call, so it lives exactly as long as the call needs it.
+ */
+template<typename V, typename A>
+struct InOutSlot { V copy; };
+template<typename V>
+struct InOutSlot<V, V> {};
+
+/** `InOutSlot` for the member `IO` and the actual `A` (as `decltype` names them). */
+template<typename IO, typename A>
+using inout_slot_t = InOutSlot<inout_value_t<IO>,
+    typename std::remove_cv<typename std::remove_reference<A>::type>::type>;
+
+/**
+ * Bind an in-out to the caller's variable before the call: by reference when
+ * it is of the in-out's own type, else to the call's copy of it.
+ */
+template<typename V>
+inline void iec_inout_bind(InOut<V>& io, V& actual, InOutSlot<V, V>&) noexcept {
+    io.bind(actual);
+}
+template<typename V, typename A>
+inline void iec_inout_bind(InOut<V>& io, A& actual, InOutSlot<V, A>& slot) noexcept {
+    slot.copy = actual;
+    io.bind(slot.copy);
+}
+
+/** After the call: copy the call's copy back, and drop the binding to it. */
+template<typename V>
+inline void iec_inout_back(InOut<V>&, V&, InOutSlot<V, V>&) noexcept {}
+template<typename V, typename A>
+inline void iec_inout_back(InOut<V>& io, A& actual, InOutSlot<V, A>& slot) noexcept {
+    actual = slot.copy;
+    io.unbind();
+}
+
+/**
+ * The two-argument forms are what a library built by an older STruC++ calls.
+ * A same-type actual binds as before; one that needs a copy has nowhere to
+ * keep it, so it is refused when the library's code is compiled.
  */
 template<typename V>
 inline bool iec_inout_bind(InOut<V>& io, V& actual) noexcept {
@@ -685,15 +748,13 @@ inline bool iec_inout_bind(InOut<V>& io, V& actual) noexcept {
     return false;
 }
 template<typename V, typename A>
-inline bool iec_inout_bind(InOut<V>& io, A& actual) noexcept {
-    io = actual;
+inline bool iec_inout_bind(InOut<V>&, A&) noexcept {
+    static_assert(sizeof(A) == 0,
+        "VAR_IN_OUT copy-in from code generated by an older STruC++ "
+        "(in-outs held their own copy): rebuild the library with this STruC++");
     return true;
 }
-
-/** Copy a copied-in in-out back to the caller's variable after the call. */
 template<typename V, typename A>
-inline void iec_inout_back(InOut<V>& io, A& actual) noexcept {
-    actual = io.copy;
-}
+inline void iec_inout_back(InOut<V>&, A&) noexcept {}
 
 } // namespace strucpp

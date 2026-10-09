@@ -20,6 +20,7 @@ import type {
   MethodCallExpression,
   IECType,
   ElementaryType,
+  EnumType,
   ReferenceType,
   StructType,
   CompilationUnit,
@@ -49,10 +50,19 @@ import {
   resolveAccessType,
   resolveArrayElementAccessType,
   resolveFieldDeclaration,
+  isSameEnum,
+  namedValuesBase,
   type AccessLookup,
   type AccessType,
 } from "./type-utils.js";
 import { stripEnEno } from "../ast-utils.js";
+
+/** A parameter of a called function or FB, as an argument binds to it. */
+interface CallParameter {
+  name: string;
+  type: string;
+  direction: "in" | "inout" | "out";
+}
 
 // Re-export from type-utils for backward compatibility
 export { ELEMENTARY_TYPES, TYPE_CATEGORIES } from "./type-utils.js";
@@ -151,6 +161,68 @@ function isNullInitializer(expr: Expression): boolean {
     expr.kind === "LiteralExpression" &&
     (expr.literalType === "NULL" || expr.value === 0)
   );
+}
+
+/** The standard functions that take an enumerated type itself (IEC 61131-3 Table 38). */
+const ENUM_TYPE_FUNCTIONS = new Set(["SEL", "MUX", "EQ", "NE"]);
+
+/** Standard-function parameter constraints that admit elementary types only. */
+const ELEMENTARY_ONLY = new Set<string>([
+  "ANY_ELEMENTARY",
+  "ANY_MAGNITUDE",
+  "ANY_NUM",
+  "ANY_INT",
+  "ANY_REAL",
+  "ANY_BIT",
+  "ANY_STRING",
+]);
+
+/** Operators whose operands share one type (6.6.1.7.2): arithmetic and bitwise. */
+const LITERAL_TYPED_OPERATORS = new Set([
+  "+",
+  "-",
+  "*",
+  "/",
+  "MOD",
+  "AND",
+  "OR",
+  "XOR",
+]);
+
+/** The value range of each integer and bit-string type, for untyped literals. */
+const INTEGER_RANGES: Record<string, readonly [bigint, bigint]> = {
+  SINT: [-128n, 127n],
+  INT: [-32768n, 32767n],
+  DINT: [-2147483648n, 2147483647n],
+  LINT: [-9223372036854775808n, 9223372036854775807n],
+  USINT: [0n, 255n],
+  BYTE: [0n, 255n],
+  UINT: [0n, 65535n],
+  WORD: [0n, 65535n],
+  UDINT: [0n, 4294967295n],
+  DWORD: [0n, 4294967295n],
+  ULINT: [0n, 18446744073709551615n],
+  LWORD: [0n, 18446744073709551615n],
+};
+
+/** Whether `expr` is an integer literal without a type prefix whose value `type` holds. */
+function untypedIntegerFits(expr: Expression, type: ElementaryType): boolean {
+  if (expr.kind !== "LiteralExpression" || expr.typePrefix !== undefined) {
+    return false;
+  }
+  if (expr.literalType !== "INT") return false;
+  const range = INTEGER_RANGES[type.name.toUpperCase()];
+  if (range === undefined) return false;
+  let value: bigint;
+  try {
+    value =
+      typeof expr.value === "number"
+        ? BigInt(expr.value)
+        : BigInt(String(expr.value));
+  } catch {
+    return false;
+  }
+  return value >= range[0] && value <= range[1];
 }
 
 /** The reference levels and target type of a declared type; undefined for an array. */
@@ -501,6 +573,24 @@ export class TypeChecker {
       return undefined;
     }
 
+    if (symbol.kind === "enumValue") {
+      return this.enumMemberType(expr, symbol.enumType);
+    }
+
+    // `Light#RED` (and `Light.RED`): a value of that enumerated type.
+    if (
+      symbol.kind === "type" &&
+      symbol.resolvedType?.typeKind === "enum" &&
+      expr.fieldAccess.length === 1 &&
+      expr.subscripts.length === 0 &&
+      (symbol.resolvedType as EnumType).values.some(
+        (v) => v.toUpperCase() === expr.fieldAccess[0]?.toUpperCase(),
+      )
+    ) {
+      expr.resolvedType = symbol.resolvedType;
+      return symbol.resolvedType;
+    }
+
     if (symbol.kind !== "variable" && symbol.kind !== "constant") {
       return undefined;
     }
@@ -626,8 +716,18 @@ export class TypeChecker {
     expr: BinaryExpression,
     scope: Scope,
   ): IECType | undefined {
-    const leftType = this.resolveExprType(expr.left, scope);
-    const rightType = this.resolveExprType(expr.right, scope);
+    const resolvedLeft = this.resolveExprType(expr.left, scope);
+    const resolvedRight = this.resolveExprType(expr.right, scope);
+    const enumMisuse = this.validateEnumOperands(
+      expr,
+      resolvedLeft,
+      resolvedRight,
+    );
+    // A named value is a value of its base type (6.4.4.3), so it computes as one.
+    const leftType =
+      this.namedOperandBase(resolvedLeft, resolvedRight) ?? resolvedLeft;
+    const rightType =
+      this.namedOperandBase(resolvedRight, resolvedLeft) ?? resolvedRight;
 
     // A comparison is BOOL whatever its operands are, so it is typed even
     // when an operand is not (a bare enumeration value, for one). Leaving it
@@ -638,7 +738,7 @@ export class TypeChecker {
       return bool;
     }
 
-    if (leftType === undefined || rightType === undefined) {
+    if (leftType === undefined || rightType === undefined || enumMisuse) {
       return undefined;
     }
 
@@ -675,6 +775,96 @@ export class TypeChecker {
 
     if (type) expr.resolvedType = type;
     return type;
+  }
+
+  /**
+   * The type of a bare enumerated value (`GREEN`): its enumeration, when only
+   * one declares it. A name two enumerations share is left untyped; the
+   * analyzer reports it as ambiguous.
+   */
+  private enumMemberType(
+    expr: VariableExpression,
+    enumType: string,
+  ): IECType | undefined {
+    if (this.hasMemberAccess(expr)) return undefined;
+    if (this.sharedEnumMembers === undefined) {
+      const seen = new Map<string, number>();
+      for (const sym of this.symbolTables.globalScope.getAllSymbols()) {
+        if (sym.kind !== "type" || sym.resolvedType?.typeKind !== "enum") {
+          continue;
+        }
+        for (const v of (sym.resolvedType as EnumType).values) {
+          const key = v.toUpperCase();
+          seen.set(key, (seen.get(key) ?? 0) + 1);
+        }
+      }
+      this.sharedEnumMembers = new Set(
+        [...seen].filter(([, n]) => n > 1).map(([k]) => k),
+      );
+    }
+    if (this.sharedEnumMembers.has(expr.name.toUpperCase())) return undefined;
+    const type = this.symbolTables.lookupType(enumType)?.resolvedType;
+    if (type?.typeKind !== "enum") return undefined;
+    expr.resolvedType = type;
+    return type;
+  }
+
+  /** Enumerated value names more than one global enumeration declares. */
+  private sharedEnumMembers: Set<string> | undefined;
+
+  /**
+   * The base type of a named-values operand whose partner is not of its own
+   * type; undefined otherwise, so `a = b` of one type stays that type.
+   */
+  private namedOperandBase(
+    operand: IECType | undefined,
+    other: IECType | undefined,
+  ): IECType | undefined {
+    if (operand === undefined) return undefined;
+    if (other !== undefined && isSameEnum(operand, other)) return undefined;
+    return namedValuesBase(operand);
+  }
+
+  /**
+   * An enumerated value (IEC 61131-3 Ed.3 6.4.4.2) is compared only with one
+   * of its own type, and takes no arithmetic: Table 38 admits SEL, MUX, EQ and
+   * NE. A data type with named values (6.4.4.3) computes as its base type, so
+   * `x = 27` and `Amber + 1` are allowed for one.
+   */
+  private validateEnumOperands(
+    expr: BinaryExpression,
+    left: IECType | undefined,
+    right: IECType | undefined,
+  ): boolean {
+    if (left === undefined || right === undefined) return false;
+    if (left.typeKind !== "enum" && right.typeKind !== "enum") return false;
+    if (isGenericGroupType(left) || isGenericGroupType(right)) return false;
+    const comparison = ["=", "<>", "<", ">", "<=", ">="].includes(
+      expr.operator,
+    );
+    if (comparison && isSameEnum(left, right)) return false;
+    const asNumber = (t: IECType): boolean =>
+      t.typeKind === "enum"
+        ? namedValuesBase(t) !== undefined
+        : t.typeKind === "elementary" &&
+          (_isTypeInCategory(t, "ANY_NUM") || _isTypeInCategory(t, "ANY_BIT"));
+    if (asNumber(left) && asNumber(right)) return false;
+
+    const plain = [left, right].find(
+      (t) => t.typeKind === "enum" && namedValuesBase(t) === undefined,
+    );
+    const shown = `${typeNameUtil(left)} ${expr.operator} ${typeNameUtil(right)}`;
+    this.addError(
+      plain === undefined
+        ? `Operator '${expr.operator}' cannot combine ${shown}`
+        : comparison
+          ? `Cannot compare ${shown}: an enumerated value compares only with a value of its own type (IEC 61131-3 Table 38)`
+          : `Operator '${expr.operator}' is not defined for the enumeration ${typeNameUtil(plain)}: IEC 61131-3 Table 38 admits only SEL, MUX, EQ and NE`,
+      expr.sourceSpan.startLine,
+      expr.sourceSpan.startCol,
+      expr.sourceSpan.file,
+    );
+    return true;
   }
 
   /**
@@ -715,6 +905,7 @@ export class TypeChecker {
       this.resolveExprType(arg.value, scope);
     }
     this.validateReferenceArguments(expr, scope);
+    this.validateEnumArguments(expr, scope);
 
     const nameUpper = expr.functionName.toUpperCase();
 
@@ -1208,6 +1399,35 @@ export class TypeChecker {
   ): void {
     if (!targetType || !valueType) return;
 
+    // A data type with named values is checked as its base type (IEC 61131-3
+    // Ed.3 6.4.4.3), the messages naming the declared types.
+    const targetBase = namedValuesBase(targetType);
+    const valueBase = namedValuesBase(valueType);
+    if (
+      (targetBase || valueBase) &&
+      !(targetType.typeKind === "enum" && valueType.typeKind === "enum")
+    ) {
+      this.validateElementaryAssignment(
+        targetBase ?? targetType,
+        valueBase ?? valueType,
+        target,
+        value,
+        typeNameUtil(targetType),
+        typeNameUtil(valueType),
+      );
+      return;
+    }
+    this.validateElementaryAssignment(targetType, valueType, target, value);
+  }
+
+  private validateElementaryAssignment(
+    targetType: IECType,
+    valueType: IECType,
+    target: Expression,
+    value: Expression,
+    targetShown = typeNameUtil(targetType),
+    valueShown = typeNameUtil(valueType),
+  ): void {
     // Integer/real/bool literals without explicit type prefix are polymorphic:
     // they can be assigned to any compatible numeric or bit type.
     if (this.isUntypedNumericLiteral(value)) {
@@ -1258,10 +1478,20 @@ export class TypeChecker {
           }
         }
 
-        // Narrowing conversions are warnings, not errors
+        // Narrowing conversions are warnings, not errors. An untyped integer
+        // literal operand computes in its partner's type (6.6.1.6 rule 8 leaves
+        // literals to the implementer), so `u := u + 1` is USINT throughout.
         if (isNarrowingConversion(tName, vName)) {
+          const literalTyped = this.typeWithLiteralOperands(value);
+          if (
+            literalTyped !== undefined &&
+            !isNarrowingConversion(tName, literalTyped.name) &&
+            _isAssignable(targetType, literalTyped)
+          ) {
+            return;
+          }
           this.addWarning(
-            `Implicit narrowing conversion from ${vName} to ${tName}`,
+            `Implicit narrowing conversion from ${valueShown} to ${targetShown}`,
             value.sourceSpan.startLine,
             value.sourceSpan.startCol,
             value.sourceSpan.file,
@@ -1271,7 +1501,7 @@ export class TypeChecker {
       }
 
       this.addError(
-        `Cannot assign ${typeNameUtil(valueType)} to ${typeNameUtil(targetType)}`,
+        `Cannot assign ${valueShown} to ${targetShown}`,
         value.sourceSpan.startLine,
         value.sourceSpan.startCol,
         value.sourceSpan.file,
@@ -1284,6 +1514,43 @@ export class TypeChecker {
    * Check if an expression is an untyped numeric literal (no explicit type prefix).
    * These are polymorphic and can be assigned to any compatible numeric type.
    */
+  /**
+   * The type of an arithmetic or bitwise expression when each untyped integer
+   * literal operand takes the type of the operand it is combined with, as it
+   * does in `usint + 1` — IEC 61131-3 6.6.1.6 rule 8 leaves non-typed literals
+   * to the implementer, and 6.6.1.7.2 has the operands of one operation share
+   * a type. A literal that does not fit that type keeps its own. Used only to
+   * judge an assignment's narrowing: the expression's type is unchanged.
+   */
+  private typeWithLiteralOperands(
+    expr: Expression,
+  ): ElementaryType | undefined {
+    if (expr.kind === "ParenthesizedExpression") {
+      return this.typeWithLiteralOperands(expr.expression);
+    }
+    if (
+      expr.kind === "BinaryExpression" &&
+      LITERAL_TYPED_OPERATORS.has(expr.operator)
+    ) {
+      const left = this.typeWithLiteralOperands(expr.left);
+      const right = this.typeWithLiteralOperands(expr.right);
+      if (right !== undefined && untypedIntegerFits(expr.left, right)) {
+        return right;
+      }
+      if (left !== undefined && untypedIntegerFits(expr.right, left)) {
+        return left;
+      }
+      if (left === undefined || right === undefined) return undefined;
+      const common = getCommonType(left, right);
+      return common?.typeKind === "elementary"
+        ? (common as ElementaryType)
+        : undefined;
+    }
+    return expr.resolvedType?.typeKind === "elementary"
+      ? (expr.resolvedType as ElementaryType)
+      : undefined;
+  }
+
   private isUntypedNumericLiteral(expr: Expression): boolean {
     if (expr.kind !== "LiteralExpression") return false;
     // If there's an explicit type prefix (e.g., DINT#42), it's not polymorphic
@@ -1421,6 +1688,203 @@ export class TypeChecker {
       name: m.name,
       type: m.declaration.type,
     }));
+  }
+
+  /**
+   * Every parameter of a user or library function, or of an FB instance, with
+   * its direction; the inputs and in-outs first, in declaration order, as a
+   * positional call binds them. Undefined for a standard function or an
+   * unknown callee.
+   */
+  private callParameters(
+    expr: FunctionCallExpression,
+    scope: Scope,
+  ): CallParameter[] | undefined {
+    const direction = (
+      blockType: string,
+    ): "in" | "inout" | "out" | undefined =>
+      blockType === "VAR_INPUT"
+        ? "in"
+        : blockType === "VAR_IN_OUT"
+          ? "inout"
+          : blockType === "VAR_OUTPUT"
+            ? "out"
+            : undefined;
+    const fromBlocks = (blocks: readonly VarBlock[]): CallParameter[] => {
+      const all = blocks.flatMap((b) => {
+        const d = direction(b.blockType);
+        return d === undefined
+          ? []
+          : b.declarations.flatMap((decl) =>
+              decl.names.map((name) => ({
+                name,
+                type: decl.type.name,
+                direction: d,
+              })),
+            );
+      });
+      return [
+        ...all.filter((p) => p.direction !== "out"),
+        ...all.filter((p) => p.direction === "out"),
+      ];
+    };
+    const fromSymbols = (
+      ins: readonly VariableSymbol[],
+      inouts: readonly VariableSymbol[],
+      outs: readonly VariableSymbol[],
+    ): CallParameter[] => [
+      ...ins.map((m) => ({
+        name: m.name,
+        type: m.declaration.type.name,
+        direction: "in" as const,
+      })),
+      ...inouts.map((m) => ({
+        name: m.name,
+        type: m.declaration.type.name,
+        direction: "inout" as const,
+      })),
+      ...outs.map((m) => ({
+        name: m.name,
+        type: m.declaration.type.name,
+        direction: "out" as const,
+      })),
+    ];
+
+    const fn = this.findUserFunction(expr.functionName);
+    if (fn) return fromBlocks(fn.varBlocks);
+    const upperName = expr.functionName.toUpperCase();
+    if (
+      this.stdRegistry?.lookup(upperName) ??
+      this.stdRegistry?.resolveConversion(upperName)
+    ) {
+      return undefined;
+    }
+    const libraryFn = this.symbolTables.lookupFunction(expr.functionName);
+    if (libraryFn) {
+      const params = libraryFn.parameters;
+      return fromSymbols(
+        params.filter((p) => p.isInput),
+        params.filter((p) => p.isInOut),
+        params.filter((p) => p.isOutput),
+      );
+    }
+    const sym = scope.lookup(expr.functionName);
+    if (sym?.kind !== "variable" || expr.instance) return undefined;
+    const declared = sym.declaration as VarDeclaration | undefined;
+    if (!declared) return undefined;
+    const typeName = declared.type.name.toUpperCase();
+    const chain: FunctionBlockDeclaration[] = [];
+    let current: string | undefined = typeName;
+    while (current !== undefined && chain.length < 32) {
+      const upper: string = current;
+      const fb = this.ast?.functionBlocks.find(
+        (f) => f.name.toUpperCase() === upper,
+      );
+      if (!fb) break;
+      chain.unshift(fb);
+      current = fb.extends?.toUpperCase();
+    }
+    if (chain.length > 0) {
+      return fromBlocks(chain.flatMap((fb) => fb.varBlocks));
+    }
+    const libraryFb = this.symbolTables.lookupFunctionBlock(typeName);
+    if (!libraryFb) return undefined;
+    return fromSymbols(libraryFb.inputs, libraryFb.inouts, libraryFb.outputs);
+  }
+
+  /**
+   * An argument where the parameter or the argument is enumerated. IEC
+   * 61131-3 Ed.3 6.6.1.6 applies the conversion rules of Figure 11 to input
+   * and output parameters (rules 4, 5), and those cover elementary types only:
+   * an enumerated value is passed only to its own type. A data type with named
+   * values converts as its base type (6.4.4.3). An in-out takes no conversion
+   * at all (rule 6). Other arguments are left to the checks that own them.
+   */
+  private validateEnumArguments(
+    expr: FunctionCallExpression,
+    scope: Scope,
+  ): void {
+    const args = stripEnEno(expr.arguments);
+    if (
+      !args.some((a) => a.value.resolvedType?.typeKind === "enum") &&
+      !this.mayTakeEnum(expr, scope)
+    ) {
+      return;
+    }
+    const params = this.callParameters(expr, scope);
+    if (!params) return;
+    const positional = params.filter((p) => p.direction !== "out");
+    args.forEach((arg, i) => {
+      const argName = arg.name?.toUpperCase();
+      const param =
+        argName === undefined
+          ? positional[i]
+          : params.find((p) => p.name.toUpperCase() === argName);
+      const argType = arg.value.resolvedType;
+      if (!param || !argType || isGenericGroupType(argType)) return;
+      const paramType = this.resolveNamedType(param.type);
+      if (isGenericGroupType(paramType)) return;
+      if (argType.typeKind !== "enum" && paramType.typeKind !== "enum") return;
+
+      const pin = `'${param.name}' of '${expr.functionName}'`;
+      const at = arg.value.sourceSpan;
+      if (param.direction === "inout") {
+        if (!isSameEnum(paramType, argType)) {
+          this.addError(
+            `In-out ${pin} is ${typeNameUtil(paramType)} and cannot take ${typeNameUtil(argType)}: an in-out takes no type conversion (IEC 61131-3 6.6.1.6 rule 6)`,
+            at.startLine,
+            at.startCol,
+            at.file,
+          );
+        }
+        return;
+      }
+      const [target, source] =
+        param.direction === "out" || arg.isOutput
+          ? [argType, paramType]
+          : [paramType, argType];
+      if (_isAssignable(target, source)) return;
+      const targetBase = namedValuesBase(target) ?? target;
+      const sourceBase = namedValuesBase(source) ?? source;
+      if (
+        (targetBase !== target || sourceBase !== source) &&
+        targetBase.typeKind === "elementary" &&
+        sourceBase.typeKind === "elementary" &&
+        isNarrowingConversion(
+          (targetBase as ElementaryType).name,
+          (sourceBase as ElementaryType).name,
+        )
+      ) {
+        this.addWarning(
+          `Implicit narrowing conversion from ${typeNameUtil(source)} to ${typeNameUtil(target)} at ${pin}`,
+          at.startLine,
+          at.startCol,
+          at.file,
+        );
+        return;
+      }
+      if (
+        this.isUntypedNumericLiteral(arg.value) &&
+        namedValuesBase(target) !== undefined
+      ) {
+        return;
+      }
+      this.addError(
+        `${param.direction === "out" || arg.isOutput ? "Output" : "Input"} ${pin} is ${typeNameUtil(paramType)} and cannot take ${typeNameUtil(argType)}: IEC 61131-3 defines no conversion of an enumerated value (6.6.1.6, Figure 11; Table 38)`,
+        at.startLine,
+        at.startCol,
+        at.file,
+      );
+    });
+  }
+
+  /** The callee declares an enumerated parameter: a numeric argument for it is checked. */
+  private mayTakeEnum(expr: FunctionCallExpression, scope: Scope): boolean {
+    const params = this.callParameters(expr, scope);
+    return (
+      params?.some((p) => this.resolveNamedType(p.type).typeKind === "enum") ??
+      false
+    );
   }
 
   /** The REF_TO check for each argument passed to a REF_TO input. */
@@ -1574,7 +2038,29 @@ export class TypeChecker {
     for (let i = 0; i < userArgs.length && i < desc.params.length; i++) {
       const arg = userArgs[i]!;
       const param = desc.params[i]!;
-      const argType = arg.value.resolvedType;
+      let argType = arg.value.resolvedType;
+
+      // An enumerated value takes only SEL, MUX, EQ and NE (Table 38); a value
+      // of a data type with named values is a value of its base type (6.4.4.3)
+      // and is checked as one.
+      if (
+        argType?.typeKind === "enum" &&
+        ELEMENTARY_ONLY.has(param.constraint)
+      ) {
+        const base = namedValuesBase(argType);
+        if (base === undefined) {
+          if (!ENUM_TYPE_FUNCTIONS.has(nameUpper)) {
+            this.addError(
+              `Argument '${param.name}' of '${nameUpper}' is the enumerated type ${typeNameUtil(argType)}: IEC 61131-3 Table 38 admits an enumerated value only to SEL, MUX, EQ and NE`,
+              arg.value.sourceSpan.startLine,
+              arg.value.sourceSpan.startCol,
+              arg.value.sourceSpan.file,
+            );
+          }
+          continue;
+        }
+        argType = base;
+      }
 
       if (!argType || argType.typeKind !== "elementary") continue;
 

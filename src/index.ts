@@ -37,6 +37,7 @@ import type {
 import { mergeCompilationUnits } from "./merge.js";
 import { lowerInlineTypes } from "./frontend/lower-inline-types.js";
 import { walkAST } from "./ast-utils.js";
+import { arrayElementTypeName } from "./semantic/type-utils.js";
 import { registerLibrarySymbols } from "./library/library-loader.js";
 import type { StlibArchive } from "./library/library-manifest.js";
 import { annotateErrorsWithPouContext } from "./diagnostic-pou-context.js";
@@ -155,6 +156,9 @@ function collectUsedSymbols(
         if (tr.elementTypeName) {
           referencedNames.add(tr.elementTypeName.toUpperCase());
         }
+        // `ARRAY [*] OF T` names T only in `__VLA_<n>D_T` (see library-chunks.ts).
+        const element = arrayElementTypeName(tr.name);
+        if (element !== undefined) referencedNames.add(element);
         break;
       }
       case "FunctionBlockDeclaration": {

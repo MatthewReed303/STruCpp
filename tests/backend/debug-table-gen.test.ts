@@ -1275,3 +1275,50 @@ END_PROGRAM${CFG_R}`,
     });
   });
 });
+
+describe("debug map raw leaves", () => {
+  // The C++ side is checked against the table in
+  // tests/integration/debug-bare-array-elements-cpp.test.ts; this pins the
+  // map on its own, so it holds where no C++ compiler is installed.
+  it("marks an element of a POU's own ARRAY OF enumeration / alias / subrange", () => {
+    const result = compile(`
+TYPE MyInt : INT; END_TYPE
+TYPE Color : (RED, GREEN, BLUE); END_TYPE
+TYPE Rng : INT(0..100); END_TYPE
+TYPE CArr : ARRAY[1..2] OF Color; END_TYPE
+PROGRAM Main
+  VAR
+    a1 : ARRAY[1..2] OF Color;
+    a2 : ARRAY[1..2] OF MyInt;
+    a3 : ARRAY[1..2] OF Rng;
+    a4 : CArr;
+    a5 : ARRAY[1..2] OF INT;
+    c1 : Color;
+  END_VAR
+  ;
+END_PROGRAM
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK task0(INTERVAL := T#20ms, PRIORITY := 0);
+    PROGRAM instance0 WITH task0 : Main;
+  END_RESOURCE
+END_CONFIGURATION`);
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    const leaves = result.debugMap!.leaves;
+    const raw = leaves.filter((l) => l.raw === true).map((l) => l.path);
+    expect(raw).toEqual([
+      "INSTANCE0.A1[1]",
+      "INSTANCE0.A1[2]",
+      "INSTANCE0.A2[1]",
+      "INSTANCE0.A2[2]",
+      "INSTANCE0.A3[1]",
+      "INSTANCE0.A3[2]",
+    ]);
+    // Additive: a raw leaf is still writable, so it is not readOnly, and
+    // every other leaf carries no `raw` key at all.
+    for (const l of leaves) {
+      if (l.raw === true) expect(l).not.toHaveProperty("readOnly");
+      else expect(l).not.toHaveProperty("raw");
+    }
+  });
+});

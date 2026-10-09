@@ -80,6 +80,13 @@ function serializeInitialValue(expr: Expression): string | undefined {
   }
 }
 
+/** The declaration sections that hold a function's parameters. */
+const FUNCTION_PARAMETER_BLOCKS = new Set([
+  "VAR_INPUT",
+  "VAR_OUTPUT",
+  "VAR_IN_OUT",
+]);
+
 /**
  * Serialize a variable's type reference into the manifest format,
  * preserving array dimensions and reference qualifiers.
@@ -660,27 +667,33 @@ export function compileLibrary(
           {
             name: fn.name,
             returnType: fn.returnType.name,
-            parameters: fn.varBlocks.flatMap((block) =>
-              block.declarations.flatMap((decl) => {
-                const initialValue =
-                  decl.initialValue !== undefined
-                    ? serializeInitialValue(decl.initialValue)
-                    : undefined;
-                return decl.names.map((name) => ({
-                  name,
-                  type: decl.type.name,
-                  direction:
-                    block.blockType === "VAR_OUTPUT"
-                      ? "output"
-                      : block.blockType === "VAR_IN_OUT"
-                        ? "inout"
-                        : "input",
-                  // Present ⇒ optional input (default supplied); absent ⇒
-                  // mandatory. Preserved from user ST and CODESYS-imported ST.
-                  ...(initialValue !== undefined ? { initialValue } : {}),
-                }));
-              }),
-            ),
+            ...(typeof fn.returnType.maxLength === "number"
+              ? { returnMaxLength: fn.returnType.maxLength }
+              : {}),
+            // The parameters only: a function's VAR, VAR_TEMP and
+            // VAR_EXTERNAL are its own, not something a call supplies.
+            parameters: fn.varBlocks
+              .filter((block) => FUNCTION_PARAMETER_BLOCKS.has(block.blockType))
+              .flatMap((block) =>
+                block.declarations.flatMap((decl) => {
+                  const initialValue =
+                    decl.initialValue !== undefined
+                      ? serializeInitialValue(decl.initialValue)
+                      : undefined;
+                  return decl.names.map((name) => ({
+                    ...serializeVarType(name, decl.type),
+                    direction:
+                      block.blockType === "VAR_OUTPUT"
+                        ? "output"
+                        : block.blockType === "VAR_IN_OUT"
+                          ? "inout"
+                          : "input",
+                    // Present ⇒ optional input (default supplied); absent ⇒
+                    // mandatory. Preserved from user ST and CODESYS-imported ST.
+                    ...(initialValue !== undefined ? { initialValue } : {}),
+                  }));
+                }),
+              ),
           },
           catByName,
         ),
@@ -726,6 +739,7 @@ export function compileLibrary(
         declaredName?: string;
         fields?: LibraryStructField[];
         members?: string[];
+        baseType?: string;
       } = { name: t.name, kind };
       // Only when it says something the folded name does not, so an all-caps
       // library adds nothing to its manifest.
@@ -736,6 +750,11 @@ export function compileLibrary(
       // them, but the symbol table is built from the manifest.
       if (t.definition.kind === "EnumDefinition") {
         entry.members = t.definition.members.map((m) => m.name);
+        // A data type with named values: a consumer types its values as the
+        // base, and debugs it at the base's width.
+        if (t.definition.baseType) {
+          entry.baseType = t.definition.baseType.name.toUpperCase();
+        }
       }
       // Export struct member fields so consumers can type `x.field` access
       // on a dependency struct, and lay out its arrays and strings.

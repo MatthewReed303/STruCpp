@@ -41,6 +41,7 @@
 #pragma once
 
 #include <cstddef>
+#include <type_traits>
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
@@ -147,17 +148,32 @@ constexpr uint8_t LEAF_FLAG_RETAIN = 1 << 1;
 // forced and written at that variable's own name.
 constexpr uint8_t LEAF_FLAG_INDIRECT = 1 << 2;
 
+// RAW marks a leaf that is the value itself, with no forcing wrapper around
+// it: an element of an ARRAY whose element type C++ stores bare (an
+// enumeration, an alias or a subrange declared in a POU's own ARRAY). It is
+// read and written in place at its own width. It has nowhere to keep a force,
+// so forcing it is refused (STATUS_READ_ONLY) and unforcing it is a no-op.
+// Set from the element's C++ type (`leaf_raw_flag`), not from the ST type.
+constexpr uint8_t LEAF_FLAG_RAW = 1 << 3;
+
+/** LEAF_FLAG_RAW for a bare scalar (an arithmetic or enum type), else 0. */
+template<typename T>
+struct leaf_raw_flag
+    : std::integral_constant<uint8_t,
+          (std::is_arithmetic<typename std::remove_cv<typename std::remove_reference<T>::type>::type>::value ||
+           std::is_enum<typename std::remove_cv<typename std::remove_reference<T>::type>::type>::value)
+              ? LEAF_FLAG_RAW
+              : uint8_t{0}> {};
+
 /**
  * Where an INDIRECT leaf's variable is: the bound pointer (`InOut::ref`), and
- * the leaf's offset inside the in-out's type — taken as the distance from the
- * block's own copy (`InOut::copy`, a real object of that type) to the same
- * leaf inside it, so a member or element at any depth needs no `offsetof`.
- * All three are address constants, so the table stays in flash.
+ * the leaf's byte offset inside the in-out's type — an `offsetof` chain the
+ * compiler evaluates (struct members, array elements), so the instance needs
+ * no object of that type. Both are constants, so the table stays in flash.
  */
 struct IndirectRef {
     const void* binding;     // &instance.MEMBER.ref  (a V*)
-    const void* proto_base;  // &instance.MEMBER.copy
-    const void* proto_leaf;  // &instance.MEMBER.copy<.field / [i] ...>
+    uintptr_t offset;        // the leaf's offset inside V
 };
 
 // ---------------------------------------------------------------------------

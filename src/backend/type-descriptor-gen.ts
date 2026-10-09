@@ -89,6 +89,8 @@ export interface TypeDescriptorContext {
   types: readonly TypeDeclaration[];
   /** Library STRUCTs a member here may nest, described by their own chunks. */
   externalStructs?: readonly ExternalStruct[];
+  /** Enumerated types a library declares, which a member here may have. */
+  externalEnums?: readonly string[];
   /** The C++ spelling of a struct field's declared type — the SAME function
    *  `generateStructType` uses, so the descriptor describes what was actually
    *  emitted rather than a second, independent guess at it. */
@@ -177,10 +179,16 @@ export class TypeClassifier {
   /** Folded name -> C++ name of a library STRUCT whose layout table exists. */
   private externalStructs = new Map<string, string>();
 
+  /** Folded names of enumerated types a library declares. */
+  private externalEnums = new Set<string>();
+
   constructor(
     types: readonly TypeDeclaration[],
     externalStructs: readonly ExternalStruct[] = [],
+    externalEnums: readonly string[] = [],
   ) {
+    for (const name of externalEnums)
+      this.externalEnums.add(name.toUpperCase());
     for (const ext of externalStructs) {
       const upper = ext.name.toUpperCase();
       this.externalStructs.set(upper, ext.name);
@@ -326,11 +334,12 @@ export class TypeClassifier {
       };
     }
 
-    if (this.enums.has(upper)) {
+    if (this.enums.has(upper) || this.externalEnums.has(upper)) {
       const def = this.enums.get(upper);
       // TYPE_ENUM says it is an enumeration; the payload is the underlying
-      // integer, whose width is what BITSIZE has to report.
-      const baseName = (def?.baseType?.name ?? "DINT").toUpperCase();
+      // integer, whose width is what BITSIZE has to report. An enumeration
+      // without a base is stored as INT.
+      const baseName = (def?.baseType?.name ?? "INT").toUpperCase();
       if (TYPE_CLASS_BY_IEC_TYPE[baseName] === undefined) return undefined;
       return {
         typeClass: "TYPE_ENUM",
@@ -389,7 +398,11 @@ export class TypeDescriptorGenerator {
   private poolOwner = "";
 
   constructor(private readonly ctx: TypeDescriptorContext) {
-    this.types = new TypeClassifier(ctx.types, ctx.externalStructs);
+    this.types = new TypeClassifier(
+      ctx.types,
+      ctx.externalStructs,
+      ctx.externalEnums,
+    );
   }
 
   /** `<NAME>__STRINGS + n`: where `text` sits in the current table's pool. */

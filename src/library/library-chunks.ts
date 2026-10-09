@@ -16,6 +16,7 @@
 
 import { walkAST } from "../ast-utils.js";
 import type { ASTNode, CompilationUnit } from "../frontend/ast.js";
+import { arrayElementTypeName } from "../semantic/type-utils.js";
 import type {
   LibraryChunk,
   LibraryChunkDep,
@@ -219,6 +220,11 @@ function collectReferencedNames(node: ASTNode, out: Set<string>): void {
         if (tr.elementTypeName) {
           out.add(tr.elementTypeName.toUpperCase());
         }
+        // An `ARRAY [*] OF T` carries T only in its synthetic name
+        // (`__VLA_1D_T`): without it a block taking one would not pull in T's
+        // chunk, and a project using the block but not T fails to compile.
+        const element = arrayElementTypeName(tr.name);
+        if (element !== undefined) out.add(element);
         break;
       }
       case "FunctionBlockDeclaration": {

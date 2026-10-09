@@ -131,7 +131,7 @@ Three-pass analysis orchestrated by `SemanticAnalyzer`:
 
 - Implicit widening: SINT -> INT -> DINT -> LINT
 - Narrowing conversions produce warnings, not errors (CODESYS compatibility)
-- Untyped numeric literals are polymorphic (assignable to any numeric type)
+- Untyped numeric literals are polymorphic (assignable to any numeric type); as an operand of an arithmetic or bitwise operation, an untyped integer literal takes its partner's type when the value fits it (`usint + 1` is USINT), so the assignment is not reported as narrowing
 - Typed literals (`INT#5`, `DINT#42`) resolve to their declared type
 - Integer-to-bit implicit conversion when target bits >= source bits
 - Reference/pointer assignments skip compatibility checks

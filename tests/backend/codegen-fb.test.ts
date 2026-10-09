@@ -340,8 +340,8 @@ describe("Codegen - Function Blocks", () => {
   describe("VAR_IN_OUT binding", () => {
     // A value in-out is the caller's variable (IEC 61131-3 §3.48): the call
     // binds the block's strucpp::InOut member to it by reference, the address
-    // taken once before the call. Only an actual of another type is copied
-    // back (iec_inout_back, guarded by the bind's result).
+    // taken once before the call. Only an actual of another type is copied,
+    // into the call's own slot beside it (empty for the same type).
     it("binds a scalar inout to the caller's variable", () => {
       const result = compileAndCheck(`
         FUNCTION_BLOCK Bumper
@@ -355,10 +355,10 @@ describe("Codegen - Function Blocks", () => {
       `);
       expect(result.headerCode).toContain("strucpp::InOut<IEC_INT> V;");
       expect(result.cppCode).toMatch(
-        /auto\* (__io\d+) = &X;\n\s*const bool (__ioc\d+) = strucpp::iec_inout_bind\(FB\.V, \*\1\);/,
+        /auto\* (__io\d+) = &X;\n\s*strucpp::inout_slot_t<decltype\(BUMPER::V\), decltype\(\*\1\)> (__ios\d+);\n\s*strucpp::iec_inout_bind\(FB\.V, \*\1, \2\);/,
       );
       expect(result.cppCode).toMatch(
-        /if \(__ioc\d+\) strucpp::iec_inout_back\(FB\.V, \*__io\d+\);/,
+        /strucpp::iec_inout_back\(FB\.V, \*__io\d+, __ios\d+\);/,
       );
       expect(result.cppCode).not.toContain("X = FB.V;");
       // Inside the block, the in-out is reached through its binding.
@@ -378,7 +378,7 @@ describe("Codegen - Function Blocks", () => {
         END_PROGRAM
       `);
       expect(result.cppCode).toMatch(
-        /auto\* (__io\d+) = &MYPT;\n\s*const bool __ioc\d+ = strucpp::iec_inout_bind\(FB\.P, \*\1\);/,
+        /auto\* (__io\d+) = &MYPT;\n.*\n\s*strucpp::iec_inout_bind\(FB\.P, \*\1, __ios\d+\);/,
       );
       expect(result.cppCode).not.toContain("MYPT = FB.P;");
     });
@@ -400,11 +400,11 @@ describe("Codegen - Function Blocks", () => {
       `);
       // the inner FB is bound to a field of the outer FB's own in-out...
       expect(result.cppCode).toMatch(
-        /auto\* (__io\d+) = &O\.var\(\)\.INR;\n\s*const bool __ioc\d+ = strucpp::iec_inout_bind\(W\.A, \*\1\);/,
+        /auto\* (__io\d+) = &O\.var\(\)\.INR;\n.*\n\s*strucpp::iec_inout_bind\(W\.A, \*\1, __ios\d+\);/,
       );
       // ...and the outer FB to the program variable
       expect(result.cppCode).toMatch(
-        /auto\* (__io\d+) = &TOP;\n\s*const bool __ioc\d+ = strucpp::iec_inout_bind\(M\.O, \*\1\);/,
+        /auto\* (__io\d+) = &TOP;\n.*\n\s*strucpp::iec_inout_bind\(M\.O, \*\1, __ios\d+\);/,
       );
       expect(result.cppCode).not.toContain("TOP = M.O;");
     });

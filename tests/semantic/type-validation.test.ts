@@ -142,6 +142,36 @@ describe("Type Validation", () => {
       const narrowingWarnings = warnings.filter((w) => w.includes("narrowing"));
       expect(narrowingWarnings).toHaveLength(0);
     });
+
+    // An untyped integer literal operand takes its partner's type (IEC
+    // 61131-3 6.6.1.6 rule 8: implementer-defined; 6.6.1.7.2: the operands of
+    // one operation share a type), so these compute in the target's own type.
+    it("should not warn when an untyped literal operand fits the variable's type", () => {
+      const { warnings, errors } = analyzeSource(`
+        PROGRAM Main
+          VAR u, x : USINT; s : SINT; b : BYTE; END_VAR
+          u := u + 1;
+          s := s - 1;
+          b := b AND 16#0F;
+          u := (u + 1) * 2;
+          u := x + u + 1;
+        END_PROGRAM
+      `);
+      expect(errors).toEqual([]);
+      expect(warnings.filter((w) => w.includes("narrowing"))).toEqual([]);
+    });
+
+    it("should still warn when the literal or another operand is wider", () => {
+      const { warnings } = analyzeSource(`
+        PROGRAM Main
+          VAR u : USINT; i : INT; s : SINT; END_VAR
+          u := u + 300;
+          u := u + i;
+          s := s + INT#1;
+        END_PROGRAM
+      `);
+      expect(warnings.filter((w) => w.includes("narrowing"))).toHaveLength(3);
+    });
   });
 
   describe("Condition Type Errors", () => {

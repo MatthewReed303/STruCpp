@@ -16,6 +16,7 @@ import type {
   AssertCall,
   CompilationUnit,
   ElementaryType,
+  EnumDefinition,
   EnumType,
   Expression,
   FunctionBlockDeclaration,
@@ -51,6 +52,9 @@ import {
   buildEnumMemberMap,
   describeType,
   ELEMENTARY_TYPES,
+  enumTypeOf,
+  evalIntConst,
+  NAMED_VALUES_BASE_TYPES,
   getBitAccessWidth,
   isAnyDescriptorType,
   isVarInfoType,
@@ -374,6 +378,22 @@ function partLabel(part: { resultType: string }): string {
     : part.resultType.charAt(0) + part.resultType.slice(1).toLowerCase();
 }
 
+/** Value range of each named-values base type, where a JS number holds it. */
+const NAMED_VALUES_RANGE: Record<string, [number, number]> = {
+  SINT: [-128, 127],
+  INT: [-32768, 32767],
+  DINT: [-2147483648, 2147483647],
+  LINT: [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+  USINT: [0, 255],
+  UINT: [0, 65535],
+  UDINT: [0, 4294967295],
+  ULINT: [0, Number.MAX_SAFE_INTEGER],
+  BYTE: [0, 255],
+  WORD: [0, 65535],
+  DWORD: [0, 4294967295],
+  LWORD: [0, Number.MAX_SAFE_INTEGER],
+};
+
 export class SemanticAnalyzer {
   private symbolTables: SymbolTables;
   private typeChecker: TypeChecker;
@@ -510,11 +530,7 @@ export class SemanticAnalyzer {
         // Use enum typeKind for EnumDefinition so CASE and type checks work correctly
         const resolvedType: EnumType | ElementaryType =
           typeDecl.definition.kind === "EnumDefinition"
-            ? {
-                typeKind: "enum" as const,
-                name: typeDecl.name,
-                values: typeDecl.definition.members.map((m) => m.name),
-              }
+            ? enumTypeOf(typeDecl.name, typeDecl.definition)
             : {
                 typeKind: "elementary" as const,
                 name: typeDecl.name,
@@ -542,7 +558,16 @@ export class SemanticAnalyzer {
           typeDecl.inline?.owner === undefined
         ) {
           typeDecl.definition.members.forEach((member, index) => {
-            if (this.symbolTables.globalScope.hasLocal(member.name)) return;
+            const existing = this.symbolTables.globalScope.lookupLocal(
+              member.name,
+            );
+            // A linked library's member of the same name gives way.
+            if (
+              existing !== undefined &&
+              !(existing.kind === "enumValue" && existing.fromLibrary === true)
+            ) {
+              return;
+            }
             this.symbolTables.globalScope.defineOrReplace({
               name: member.name,
               kind: "enumValue",
@@ -4765,6 +4790,44 @@ export class SemanticAnalyzer {
   }
 
   /**
+   * A data type with named values (IEC 61131-3 Ed.3 6.4.4.3): its base is an
+   * integer or bit-string type and every value is in the base's range. An
+   * enumeration without a base keeps its values in INT, its storage. Values
+   * that are not literals are left to the C++ compiler.
+   */
+  private validateEnumValues(typeName: string, def: EnumDefinition): void {
+    const baseRef = def.baseType;
+    const base = baseRef?.name.toUpperCase();
+    if (baseRef && base !== undefined && !NAMED_VALUES_BASE_TYPES.has(base)) {
+      this.addError(
+        `The base type of '${typeName}' must be an integer or bit-string type, not ${base}: its named values are integers`,
+        baseRef.sourceSpan.startLine,
+        baseRef.sourceSpan.startCol,
+        baseRef.sourceSpan.file,
+      );
+      return;
+    }
+    const range = NAMED_VALUES_RANGE[base ?? "INT"];
+    if (range === undefined) return;
+    let next: number | undefined = 0;
+    for (const member of def.members) {
+      const explicit =
+        member.value !== undefined ? evalIntConst(member.value) : undefined;
+      const value: number | undefined =
+        member.value !== undefined ? explicit : next;
+      if (value !== undefined && (value < range[0] || value > range[1])) {
+        this.addError(
+          `'${member.name}' := ${value} is out of range for ${base ?? "INT"} (${range[0]}..${range[1]})`,
+          member.sourceSpan.startLine,
+          member.sourceSpan.startCol,
+          member.sourceSpan.file,
+        );
+      }
+      next = value !== undefined ? value + 1 : undefined;
+    }
+  }
+
+  /**
    * Validate type references within a type definition (struct fields, array elements, etc.).
    */
   private validateTypeDefinitionReferences(
@@ -4793,6 +4856,7 @@ export class SemanticAnalyzer {
         if (def.baseType) {
           this.validateSingleTypeReference(def.baseType, `ENUM '${typeName}'`);
         }
+        this.validateEnumValues(typeName, def);
         break;
       case "TypeReference":
         // Type alias — validate the target type
@@ -5317,11 +5381,7 @@ export class SemanticAnalyzer {
       }
       const resolvedType: EnumType | ElementaryType =
         typeDecl.definition.kind === "EnumDefinition"
-          ? {
-              typeKind: "enum" as const,
-              name: typeDecl.name,
-              values: typeDecl.definition.members.map((m) => m.name),
-            }
+          ? enumTypeOf(typeDecl.name, typeDecl.definition)
           : {
               typeKind: "elementary" as const,
               name: typeDecl.name,

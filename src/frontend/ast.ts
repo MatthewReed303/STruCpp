@@ -80,6 +80,12 @@ export interface EnumType extends IECType {
   typeKind: "enum";
   name: string;
   values: string[];
+  /**
+   * Base type (upper case) of a data type with named values, IEC 61131-3 Ed.3
+   * 6.4.4.3 (`T : USINT (A := 0, ...)`), whose values are values of that type.
+   * Absent for an enumeration (6.4.4.2).
+   */
+  baseType?: string;
 }
 
 /**

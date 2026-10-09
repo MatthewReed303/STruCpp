@@ -21,6 +21,7 @@ import type {
   ReferenceKind,
   ReferenceType,
   StructType,
+  EnumDefinition,
   EnumType,
   FunctionBlockType,
   TypeReference,
@@ -542,6 +543,10 @@ export function matchesConstraint(
  * and cross-category promotions (BIT→INT, INT→REAL).
  */
 export function isAssignable(target: IECType, source: IECType): boolean {
+  if (target.typeKind === "enum" || source.typeKind === "enum") {
+    return isEnumAssignable(target, source);
+  }
+
   // Same typeKind check
   if (target.typeKind !== source.typeKind) {
     // Allow elementary-to-elementary only
@@ -575,6 +580,81 @@ export function isAssignable(target: IECType, source: IECType): boolean {
 
   // For other types (struct, array, FB), require exact match
   return JSON.stringify(target) === JSON.stringify(source);
+}
+
+// =============================================================================
+// Enumerations (6.4.4.2) and data types with named values (6.4.4.3)
+// =============================================================================
+
+/**
+ * Integer and bit-string types a data type with named values may be based on.
+ * The grammar admits any elementary type; the values are integers, so the
+ * rest has no C++ enumeration to map to.
+ */
+export const NAMED_VALUES_BASE_TYPES: ReadonlySet<string> = new Set([
+  "SINT",
+  "INT",
+  "DINT",
+  "LINT",
+  "USINT",
+  "UINT",
+  "UDINT",
+  "ULINT",
+  "BYTE",
+  "WORD",
+  "DWORD",
+  "LWORD",
+]);
+
+/** The semantic type of an enumerated or named-values TYPE declaration. */
+export function enumTypeOf(name: string, def: EnumDefinition): EnumType {
+  const base = def.baseType?.name.toUpperCase();
+  return {
+    typeKind: "enum",
+    name,
+    values: def.members.map((m) => m.name),
+    ...(base !== undefined ? { baseType: base } : {}),
+  };
+}
+
+/**
+ * The base type of a data type with named values, whose values are values of
+ * that type (6.4.4.3). Undefined for an enumeration and every other type.
+ */
+export function namedValuesBase(
+  type: IECType | undefined,
+): ElementaryType | undefined {
+  if (type?.typeKind !== "enum") return undefined;
+  const base = (type as EnumType).baseType;
+  return base !== undefined ? ELEMENTARY_TYPES[base] : undefined;
+}
+
+/** Two enumerated types that are the same declaration. */
+export function isSameEnum(a: IECType, b: IECType): boolean {
+  return (
+    a.typeKind === "enum" &&
+    b.typeKind === "enum" &&
+    (a as EnumType).name.toUpperCase() === (b as EnumType).name.toUpperCase()
+  );
+}
+
+/**
+ * Assignment where either side is enumerated. An enumerated value goes only
+ * to its own type: IEC 61131-3 defines no conversion for one (6.6.1.6, Figure
+ * 11 lists elementary types only; Table 38). A data type with named values is
+ * its base type (6.4.4.3): its value converts as the base does, and a value of
+ * the base type, constant or calculated, may be assigned to it.
+ */
+function isEnumAssignable(target: IECType, source: IECType): boolean {
+  if (target.typeKind === "enum" && source.typeKind === "enum") {
+    return isSameEnum(target, source);
+  }
+  const t = target.typeKind === "enum" ? namedValuesBase(target) : target;
+  const s = source.typeKind === "enum" ? namedValuesBase(source) : source;
+  if (t?.typeKind !== "elementary" || s?.typeKind !== "elementary") {
+    return false;
+  }
+  return isAssignable(t, s);
 }
 
 /**
@@ -623,6 +703,10 @@ export function isImplicitlyConvertible(
 
   // Same category, wider target
   if (sCat === tCat && tBits >= sBits) return true;
+
+  // Unsigned → a wider signed integer (IEC 61131-3 Ed.3 Figure 12: USINT→INT,
+  // UINT→DINT, UDINT→LINT), which holds every value of the source.
+  if (sCat === "UINT" && tCat === "SINT" && tBits > sBits) return true;
 
   // BIT → signed/unsigned integer (CODESYS: BYTE→INT)
   if (sCat === "BIT" && (tCat === "SINT" || tCat === "UINT") && tBits >= sBits)

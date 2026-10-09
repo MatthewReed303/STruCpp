@@ -507,6 +507,63 @@ inline T MUX(IEC_INT k, T in0, T in1, Args... rest) noexcept {
     return MUX(IEC_INT(iec_unwrap(k) - 1), in1, rest...);
 }
 
+/** All operands of one enumeration, at least two of them spelled differently. */
+template<typename... Ts>
+struct iec_mux_same_enum : std::false_type {};
+template<typename A, typename B>
+struct iec_mux_same_enum<A, B>
+    : std::integral_constant<bool, is_same_iec_enum<A, B>::value> {};
+template<typename A, typename B, typename C, typename... Rest>
+struct iec_mux_same_enum<A, B, C, Rest...>
+    : std::integral_constant<bool, is_same_iec_enum<A, B>::value &&
+                                       iec_mux_same_enum<B, C, Rest...>::value> {};
+
+template<typename... Ts>
+struct iec_all_same_type : std::true_type {};
+template<typename A, typename B, typename... Rest>
+struct iec_all_same_type<A, B, Rest...>
+    : std::integral_constant<bool, std::is_same<std::decay_t<A>, std::decay_t<B>>::value &&
+                                       iec_all_same_type<B, Rest...>::value> {};
+
+/**
+ * MUX of one enumeration given in mixed spellings — a variable and an
+ * enumerator: `MUX(k, RED, c)`. IEC 61131-3 Table 38 admits MUX on an
+ * enumerated type, as it does SEL. The same selection as the template above:
+ * input `k`, the last one when `k` is out of range.
+ */
+template<typename A, typename B, typename... Rest,
+         std::enable_if_t<iec_mux_same_enum<A, B, Rest...>::value &&
+                              !iec_all_same_type<A, B, Rest...>::value, int> = 0>
+inline iec_enum_of_t<std::decay_t<A>> MUX(IEC_INT k, const A& in0, const B& in1,
+                                          const Rest&... rest) noexcept {
+    using E = iec_enum_of_t<std::decay_t<A>>;
+    const E in[] = {iec_enum_value(in0), iec_enum_value(in1), iec_enum_value(rest)...};
+    const auto n = static_cast<decltype(iec_unwrap(k))>(sizeof...(Rest) + 2);
+    const auto i = iec_unwrap(k);
+    return (i >= 0 && i < n) ? in[i] : in[n - 1];
+}
+
+/**
+ * The value of a data type with named values as its base type: IEC 61131-3
+ * Ed.3 6.4.4.3 makes those values the base type's, so a standard function that
+ * takes the base type (MAX, LIMIT, ADD, …) takes them. Codegen passes such an
+ * argument through this for every standard function but SEL, MUX, EQ and NE,
+ * which take the type itself (Table 38).
+ */
+template<typename T,
+         std::enable_if_t<is_iec_named_values<iec_enum_of_t<std::decay_t<T>>>::value, int> = 0>
+inline IECVar<typename std::underlying_type<iec_enum_of_t<std::decay_t<T>>>::type>
+iec_named_base(const T& v) noexcept {
+    using U = typename std::underlying_type<iec_enum_of_t<std::decay_t<T>>>::type;
+    return IECVar<U>(static_cast<U>(iec_enum_value(v)));
+}
+
+/** A value already of the base type (a call that computed one) passes through. */
+template<typename T, std::enable_if_t<!is_iec_enum_operand_v<std::decay_t<T>>, int> = 0>
+inline const T& iec_named_base(const T& v) noexcept {
+    return v;
+}
+
 // =============================================================================
 // Comparison Functions (ANY_ELEMENTARY -> BOOL)
 // =============================================================================

@@ -509,13 +509,14 @@ export const VAR_INST = createToken({
 // =============================================================================
 
 // Time literal: T#1s, T#100ms, TIME#1h2m3s, and the LTIME forms LT#14.7s,
-// LTIME#5m_30s.
+// LTIME#5m_30s. A duration may be negative or carry a plus sign after the
+// prefix: T#-14ms, TIME#-14ms (IEC 61131-3 Ed.3 Table 8, 6.3.4).
 // Note: Each numeric component must have a unit suffix (ms, us, ns, d, h, m, s)
 // Longer suffixes (ms, us, ns) must come before shorter ones (m, s) in the alternation
 export const TimeLiteral = createToken({
   name: "TimeLiteral",
   pattern:
-    /(?:LTIME|LT|TIME|T)#(?:[0-9_]+(?:\.[0-9_]+)?(?:ms|us|ns|d|h|m|s))+/i,
+    /(?:LTIME|LT|TIME|T)#[+-]?(?:[0-9_]+(?:\.[0-9_]+)?(?:ms|us|ns|d|h|m|s))+/i,
 });
 
 // Date literal: D#2024-01-15, D#1970-9-1, and the LDATE forms LD#…, LDATE#…

@@ -35,6 +35,7 @@ import type {
   PropertyDeclaration,
   Visibility,
 } from "../frontend/ast.js";
+import { createDefaultSourceSpan } from "../frontend/ast.js";
 import type { SymbolTables } from "../semantic/symbol-table.js";
 import type { LineMapEntry, SourceSpan } from "../types.js";
 import { StdFunctionRegistry } from "../semantic/std-function-registry.js";
@@ -92,6 +93,7 @@ import {
   TYPE_CLASS_BY_IEC_TYPE,
   systemTypeClassMember,
   typeName as typeNameUtil,
+  namedValuesBase,
 } from "../semantic/type-utils.js";
 import {
   generateInitializerValue,
@@ -156,6 +158,51 @@ interface LocatedVarDescriptor {
    */
   elementIndex?: number;
 }
+
+/** A library function's parameter, as `registerLibraryFunctions` keeps it. */
+interface LibraryFunctionParam {
+  name: string;
+  type: string;
+  direction?: string;
+  maxLength?: number;
+  arrayDimensions?: Array<{ start: number; end: number }>;
+  elementTypeName?: string;
+  elementMaxLength?: number | string;
+}
+
+/** The declared type of a library function's parameter. */
+function libraryParamTypeRef(p: LibraryFunctionParam): TypeReference {
+  return {
+    kind: "TypeReference",
+    sourceSpan: createDefaultSourceSpan(),
+    name: p.type,
+    isReference: false,
+    referenceKind: "none",
+    ...(p.maxLength !== undefined ? { maxLength: p.maxLength } : {}),
+    ...(p.arrayDimensions !== undefined
+      ? { arrayDimensions: p.arrayDimensions }
+      : {}),
+    ...(p.elementTypeName !== undefined
+      ? { elementTypeName: p.elementTypeName }
+      : {}),
+    ...(p.elementMaxLength !== undefined
+      ? { elementMaxLength: p.elementMaxLength }
+      : {}),
+  } as TypeReference;
+}
+
+/** The standard functions that take an enumerated type itself (IEC 61131-3 Table 38). */
+const ENUM_TYPE_STD_FUNCTIONS = new Set(["SEL", "MUX", "EQ", "NE"]);
+
+/** Standard-function parameter constraints that admit elementary types only. */
+const ELEMENTARY_CATEGORY_CONSTRAINTS = new Set<string>([
+  "ANY_ELEMENTARY",
+  "ANY_MAGNITUDE",
+  "ANY_NUM",
+  "ANY_INT",
+  "ANY_REAL",
+  "ANY_BIT",
+]);
 
 /** How a POU body reaches one `GlobalVar<V>`: its VAR_EXTERNAL pointer. */
 interface GlobalRef {
@@ -715,6 +762,10 @@ export class CodeGenerator {
   private libraryEnumDescriptors: Array<{ name: string; members: string[] }> =
     [];
 
+  /** Every enumerated type an imported library declares, for the STRUCT
+   *  layout tables of a project type holding one. */
+  private libraryEnumNames: string[] = [];
+
   /** Map of UPPER(functionName) → UPPER(paramName) → the generic type it was
    *  declared with.
    *
@@ -725,6 +776,12 @@ export class CodeGenerator {
   /** Map of UPPER(functionName) → its parameter names in declaration order,
    *  so a positional argument can be matched to the parameter it fills. */
   private functionParamOrder: Map<string, string[]> = new Map();
+
+  /** UPPER(library function) → its parameters as the manifest lists them, so a
+   *  call that leaves out a trailing VAR_OUTPUT / VAR_IN_OUT gets a temporary,
+   *  as a call of a function in the project does. */
+  private libraryFunctionParams: Map<string, LibraryFunctionParam[]> =
+    new Map();
 
   /** UPPER(functionName) → its VAR_IN_OUT and VAR_OUTPUT parameters (UPPER),
    *  which the C++ function takes by reference. */
@@ -1089,6 +1146,7 @@ export class CodeGenerator {
     for (const t of types) {
       const nameUpper = t.name.toUpperCase();
       if (t.kind === "enum") {
+        this.libraryEnumNames.push(t.name);
         // The name alone is enough for `::` emission in
         // generateVariableExpression; the members, when the archive carries
         // them, are what lets a bare enumerator be qualified.
@@ -1212,16 +1270,15 @@ export class CodeGenerator {
       | Array<{
           name: string;
           returnType?: string;
-          parameters?: Array<{
-            name: string;
-            type: string;
-            direction?: string;
-          }>;
+          parameters?: LibraryFunctionParam[];
         }>
       | undefined,
   ): void {
     for (const fn of functions ?? []) {
       const key = fn.name.toUpperCase();
+      if (fn.parameters !== undefined && !this.libraryFunctionParams.has(key)) {
+        this.libraryFunctionParams.set(key, fn.parameters);
+      }
       if (fn.returnType?.toUpperCase() === "VOID") this.voidFunctions.add(key);
       const order: string[] = [];
       for (const param of fn.parameters ?? []) {
@@ -1589,9 +1646,11 @@ export class CodeGenerator {
 
     // Build set of known struct/UDT types and enum member maps
     const enumDescriptors: Array<{ name: string; members: string[] }> = [];
-    this.typeClassifier = new TypeClassifier(ast.types, [
-      ...this.libraryDescribedStructs.values(),
-    ]);
+    this.typeClassifier = new TypeClassifier(
+      ast.types,
+      [...this.libraryDescribedStructs.values()],
+      this.libraryEnumNames,
+    );
     for (const td of ast.types) {
       this.knownStructTypes.add(td.name.toUpperCase());
       if (td.definition.kind === "StructDefinition") {
@@ -5748,6 +5807,14 @@ export class CodeGenerator {
     return argExpr;
   }
 
+  /** The base type of an argument of a data type with named values, if it is one. */
+  private namedValuesBaseName(expr: Expression): string | undefined {
+    const type = expr.resolvedType;
+    if (type === undefined) return undefined;
+    const base = namedValuesBase(type);
+    return base !== undefined ? typeNameUtil(base).toUpperCase() : undefined;
+  }
+
   /**
    * For std-lib template functions (like LIMIT, MAX, MIN) where all params
    * share the same generic constraint, harmonize argument types so C++ template
@@ -5758,6 +5825,7 @@ export class CodeGenerator {
     args: string[],
     argExprs: FunctionCallExpression["arguments"],
     stdFunc: { params: Array<{ constraint: string }> },
+    typeOverrides: Array<string | undefined> = [],
   ): void {
     // Only harmonize when all params share the same generic constraint
     if (stdFunc.params.length === 0) return;
@@ -5769,8 +5837,8 @@ export class CodeGenerator {
     if (!allSame) return;
 
     // Infer types for all arguments
-    const argTypes: (string | undefined)[] = argExprs.map((a) =>
-      this.inferExprType(a.value),
+    const argTypes: (string | undefined)[] = argExprs.map(
+      (a, i) => typeOverrides[i] ?? this.inferExprType(a.value),
     );
 
     // Separate variable types from literal types
@@ -6050,7 +6118,30 @@ export class CodeGenerator {
         }
         return generated;
       });
-      this.harmonizeStdFuncArgs(args, expr.arguments, stdFunc);
+      // A value of a data type with named values is a value of its base type
+      // (IEC 61131-3 Ed.3 6.4.4.3), so a standard function takes it as one.
+      // SEL, MUX, EQ and NE take the type itself (Table 38).
+      const argTypes: Array<string | undefined> = [];
+      if (!ENUM_TYPE_STD_FUNCTIONS.has(nameUpper)) {
+        expr.arguments.forEach((arg, idx) => {
+          const base = this.namedValuesBaseName(arg.value);
+          if (base === undefined || idx >= args.length) return;
+          // Only where the parameter takes an elementary category; an ANY
+          // or by-reference parameter takes the variable as it is.
+          const param =
+            stdFunc.params[Math.min(idx, stdFunc.params.length - 1)];
+          if (
+            param === undefined ||
+            param.isByRef ||
+            !ELEMENTARY_CATEGORY_CONSTRAINTS.has(param.constraint)
+          ) {
+            return;
+          }
+          args[idx] = `strucpp::iec_named_base(${args[idx]})`;
+          argTypes[idx] = base;
+        });
+      }
+      this.harmonizeStdFuncArgs(args, expr.arguments, stdFunc, argTypes);
       return `${this.runtimeFunction(stdFunc.cppName)}(${args.join(", ")})`;
     }
 
@@ -6121,6 +6212,18 @@ export class CodeGenerator {
           } else {
             args.push(this.getTypeDefaultValue(param.typeName));
           }
+        }
+      } else {
+        // A library function: the same temporaries for its trailing outputs.
+        // Stops at an input: an older archive also listed the function's own
+        // locals as inputs, which the C++ signature does not have.
+        const params = this.libraryFunctionParams.get(nameUpper) ?? [];
+        while (args.length < params.length) {
+          const param = params[args.length]!;
+          if (param.direction !== "output" && param.direction !== "inout") {
+            break;
+          }
+          args.push(this.emitOutputTempVarOfType(libraryParamTypeRef(param)));
         }
       }
     }
@@ -6454,6 +6557,16 @@ export class CodeGenerator {
     return name;
   }
 
+  /** {@link emitOutputTempVar} for a full type (an array's bounds), as a
+   *  by-reference parameter of that type is declared ({@link toParamTypeRef}). */
+  private emitOutputTempVarOfType(type: TypeReference): string {
+    const name = `__output_tmp_${this.tempVarCounter++}`;
+    this.emit(
+      `${this.currentStatementIndent}${this.mapTypeRefToCpp(this.toParamTypeRef(type))} ${name};`,
+    );
+    return name;
+  }
+
   /**
    * Check if a type name refers to a known function block type.
    */
@@ -6756,6 +6869,7 @@ export class CodeGenerator {
         ...this.libraryDescribedStructs.values(),
         ...this.describedProjectStructs,
       ],
+      externalEnums: this.libraryEnumNames,
     });
     const typeCode = typeCodeGen.generateFromRegistry(typeRegistry);
     for (const t of typeCodeGen.describedTypes)
@@ -7227,12 +7341,17 @@ export class CodeGenerator {
     // Value in-outs bound to the caller's variable itself (by reference): the
     // address is taken ONCE, before the call, so an index the call changes
     // does not move the binding, and two in-outs naming one variable are one
-    // variable. `copied` is true only where the actual could not be bound (a
-    // different type), and then it is copied back after the call.
-    const boundInouts = new Map<Argument, { ptr: string; copied: string }>();
+    // variable. `slot` is the call's own copy where the actual is of another
+    // type (empty otherwise), copied back after the call.
+    const boundInouts = new Map<Argument, { ptr: string; slot: string }>();
+    // Value in-outs whose actual cannot be bound (a bit, a shared global): the
+    // call's own copy, copied in before and back after (`tmp`).
+    const copiedInouts = new Map<Argument, string>();
     const valueInouts = fbTypeName
       ? this.valueInoutsOf(fbTypeName)
       : new Set<string>();
+    const fbClass =
+      fbTypeName !== undefined ? this.mapVarTypeToCpp(fbTypeName) : "";
 
     // Which parameter each argument fills. A named one says so; the rest take
     // the slots the named ones left, in declaration order.
@@ -7299,15 +7418,35 @@ export class CodeGenerator {
         this.inoutBindsByReference(arg.value)
       ) {
         const ptr = `__io${this.tempVarCounter++}`;
-        const copied = `__ioc${this.tempVarCounter++}`;
+        const slot = `__ios${this.tempVarCounter++}`;
+        const member = this.fbParamMemberName(paramName, fbTypeName);
         this.emit(
           `${indent}auto* ${ptr} = ${this.generateAddressOf(arg.value)};`,
         );
         this.emit(
-          `${indent}const bool ${copied} = strucpp::iec_inout_bind(${instanceName}.${this.fbParamMemberName(paramName, fbTypeName)}, *${ptr});`,
+          `${indent}strucpp::inout_slot_t<decltype(${fbClass}::${member}), decltype(*${ptr})> ${slot};`,
         );
-        boundInouts.set(arg, { ptr, copied });
+        this.emit(
+          `${indent}strucpp::iec_inout_bind(${instanceName}.${member}, *${ptr}, ${slot});`,
+        );
+        boundInouts.set(arg, { ptr, slot });
         if (!arg.name) positionalIndex++;
+      } else if (
+        paramName !== undefined &&
+        valueInouts.has(paramName.toUpperCase())
+      ) {
+        // Not bindable: the call's own copy, beside the call.
+        const tmp = `__iot${this.tempVarCounter++}`;
+        const member = this.fbParamMemberName(paramName, fbTypeName);
+        this.emit(
+          `${indent}strucpp::inout_value_t<decltype(${fbClass}::${member})> ${tmp};`,
+        );
+        this.emit(
+          `${indent}${tmp} = ${this.generateArgumentValue(paramName, arg.value, fbTypeName)};`,
+        );
+        this.emit(`${indent}${instanceName}.${member}.bind(${tmp});`);
+        copiedInouts.set(arg, tmp);
+        if (arg.name === undefined) positionalIndex++;
       } else if (paramName && this.isOutputParam(fbTypeName, paramName)) {
         // An output filled positionally reads back after the call, not before.
         this.emit(
@@ -7328,6 +7467,9 @@ export class CodeGenerator {
       }
     }
 
+    // A value in-out this call leaves out works on the stored binding.
+    const unbound = this.omittedValueInouts(valueInouts, slotOf, fbTypeName);
+
     // Call the FB/program execution body, wrapped with EN/ENO logic.
     // Pass the FB instance's ENO field so source code can read
     // `inst.ENO` after the invocation and see the right value.
@@ -7336,6 +7478,9 @@ export class CodeGenerator {
       enExpr,
       enoVar,
       (bi) => {
+        for (const m of unbound) {
+          this.emit(`${bi}${instanceName}.${m}.require();`);
+        }
         this.emitPOUCallLine(instanceName, call.functionName, bi);
       },
       `${instanceName}.ENO`,
@@ -7375,25 +7520,29 @@ export class CodeGenerator {
         // A function-block inout is a pointer at the caller's own instance, so
         // the callee wrote there directly.
         if (refInouts?.has(upper)) continue;
+        const member = this.fbParamMemberName(paramName, fbTypeName);
         const bound = boundInouts.get(arg);
         if (bound) {
           // Bound by reference: the callee wrote the caller's variable. Only a
           // copied-in actual (another type) is copied back, through the
           // address taken before the call.
           this.emit(
-            `${indent}if (${bound.copied}) strucpp::iec_inout_back(${instanceName}.${this.fbParamMemberName(paramName, fbTypeName)}, *${bound.ptr});`,
+            `${indent}strucpp::iec_inout_back(${instanceName}.${member}, *${bound.ptr}, ${bound.slot});`,
           );
           continue;
         }
-        // A value in-out copied in (not bound) is copied back from its copy.
-        // A structure converts from the slot in one step (InOut's V&); any
-        // other type names the copy, since its own conversions and templated
-        // assignments (a STRING of another length) would need a second step.
-        const actualType = this.inferExprType(arg.value);
-        const viaSlot =
-          valueInouts.has(upper) &&
-          (actualType === undefined || !this.structDefs.has(actualType));
-        const copiedFrom = `${instanceName}.${this.fbParamMemberName(paramName, fbTypeName)}${viaSlot ? ".var()" : ""}`;
+        // A value in-out copied in is copied back from the call's copy, and
+        // its binding to that copy dropped: the copy ends with the call.
+        const copy = copiedInouts.get(arg);
+        if (copy !== undefined) {
+          if (!this.emitBitCapture(arg.value, copy, indent)) {
+            this.emitCaptureToLvalue(arg.value, copy, indent);
+          }
+          this.emit(`${indent}${instanceName}.${member}.unbind();`);
+          continue;
+        }
+        // A plain member of a block from an older archive: its own copy.
+        const copiedFrom = `${instanceName}.${member}`;
         if (
           inoutParams.has(upper) &&
           this.emitBitCapture(arg.value, copiedFrom, indent)
@@ -7480,11 +7629,11 @@ export class CodeGenerator {
    * Call of a function block under one shared global's lock (`lockUpper`):
    * an instance held in that global (`instance` is its access path), or a
    * local instance (`instance` is its C++) with an in-out bound into it.
-   * In-outs bound into the locked global use its own storage: an ARRAY[*] or
-   * block in-out points at it, a value in-out is copied in and back inside the
-   * lock. Inputs and other lock-taking arguments are evaluated before the
-   * lock; outputs, ENO and in-outs bound elsewhere go through temporaries
-   * stored after the release, so no other global's lock is taken inside.
+   * In-outs bound into the locked global use its own storage: an ARRAY[*],
+   * block or value in-out points at it. Inputs and other lock-taking arguments
+   * are evaluated before the lock; outputs, ENO and value in-outs bound to
+   * another global (a copy beside the call) go through temporaries stored
+   * after the release, so no other global's lock is taken inside.
    */
   private generateLockedFBInvocation(
     call: FunctionCallExpression,
@@ -7524,12 +7673,31 @@ export class CodeGenerator {
     const vlaInouts = this.fbVlaInoutParams.get(fbUpper);
     const refInouts = this.fbRefInoutParams.get(fbUpper);
     const slotOf = this.fbArgSlots(args, fbTypeName);
+    const valueInouts = this.valueInoutsOf(fbTypeName);
+    const fbCpp = this.mapVarTypeToCpp(fbTypeName);
 
     const inputs: Array<{ member: string; code: string }> = [];
+    // Statements inside the lock, before the call (value in-outs bound) and
+    // after it (their copy back, and bindings to a copy dropped).
+    const lockedBind: string[] = [];
     // Value in-outs copied back inside the lock, and arguments whose in-out
     // needs no copy back after it.
     const lockedBack: Array<{ lv: string; member: string }> = [];
+    const lockedAfter: string[] = [];
+    // Value in-outs whose call's copy is stored to the actual after the lock.
+    const copiedBack: Array<{ tmp: string; target: Expression }> = [];
     const settled = new Set<Argument>();
+    /** Bind a value in-out to `*ptr` inside the lock (a copy if its type differs). */
+    const bindInLock = (member: string, ptr: string): void => {
+      const slot = `__ios${this.tempVarCounter++}`;
+      lockedBind.push(
+        `strucpp::inout_slot_t<decltype(${fbCpp}::${member}), decltype(*${ptr})> ${slot};`,
+        `strucpp::iec_inout_bind(__fbi.${member}, *${ptr}, ${slot});`,
+      );
+      lockedAfter.push(
+        `strucpp::iec_inout_back(__fbi.${member}, *${ptr}, ${slot});`,
+      );
+    };
     // ARRAY[*] in-outs bound to another global: a copy, stored back after.
     const afterStores: Array<{ target: VariableExpression; tmp: string }> = [];
     let positionalIndex = 0;
@@ -7558,8 +7726,16 @@ export class CodeGenerator {
           this.renderAccessTail("(*__glk)", global, lockUpper),
         );
         const member = this.fbParamMemberName(paramName, fbTypeName);
-        inputs.push({ member, code: isRef ? `&${lv}` : lv });
-        if (!isRef && !isVla) lockedBack.push({ lv, member });
+        if (upper !== undefined && valueInouts.has(upper)) {
+          // Bound to the global's own storage, with the call inside its lock;
+          // the binding stays, as the caller's variable's does.
+          const ptr = `__iop${this.tempVarCounter++}`;
+          lockedBind.push(`auto* ${ptr} = &(${lv});`);
+          bindInLock(member, ptr);
+        } else {
+          inputs.push({ member, code: isRef ? `&${lv}` : lv });
+          if (!isRef && !isVla) lockedBack.push({ lv, member });
+        }
         settled.add(arg);
       } else if (paramName && isRef) {
         // A function-block inout is bound to the caller's instance.
@@ -7581,9 +7757,51 @@ export class CodeGenerator {
         const ptr = `__gfp${this.tempVarCounter++}`;
         this.emit(`${indent}auto* ${ptr} = &(${this.generateExpression(v)});`);
         const member = this.fbParamMemberName(paramName, fbTypeName);
-        inputs.push({ member, code: `(*${ptr})` });
-        if (!isVla) lockedBack.push({ lv: `(*${ptr})`, member });
+        if (upper !== undefined && valueInouts.has(upper)) {
+          bindInLock(member, ptr);
+        } else {
+          inputs.push({ member, code: `(*${ptr})` });
+          if (!isVla) lockedBack.push({ lv: `(*${ptr})`, member });
+        }
         settled.add(arg);
+      } else if (
+        paramName !== undefined &&
+        upper !== undefined &&
+        valueInouts.has(upper) &&
+        this.inoutBindsByReference(v)
+      ) {
+        // The caller's own variable: bound by reference, addressed before
+        // the lock, as a call outside one binds it.
+        const ptr = `__io${this.tempVarCounter++}`;
+        this.emit(`${indent}auto* ${ptr} = ${this.generateAddressOf(v)};`);
+        bindInLock(this.fbParamMemberName(paramName, fbTypeName), ptr);
+        settled.add(arg);
+        if (arg.name === undefined) positionalIndex++;
+      } else if (
+        paramName !== undefined &&
+        upper !== undefined &&
+        valueInouts.has(upper)
+      ) {
+        // Not bindable (a bit, another shared global): the call's own copy,
+        // declared before the lock, filled and bound inside it, stored to the
+        // actual after the release.
+        const member = this.fbParamMemberName(paramName, fbTypeName);
+        const tmp = `__iot${this.tempVarCounter++}`;
+        this.emit(
+          `${indent}strucpp::inout_value_t<decltype(${fbCpp}::${member})> ${tmp};`,
+        );
+        const code =
+          this.genericParamType(fbTypeName, paramName) === undefined &&
+          this.expressionUsesRoot(v, lockUpper)
+            ? this.renderUnderLock(lockUpper, indent, () =>
+                this.generateExpression(v),
+              )
+            : value(v, this.generateArgumentValue(paramName, v, fbTypeName));
+        lockedBind.push(`${tmp} = ${code};`, `__fbi.${member}.bind(${tmp});`);
+        lockedAfter.push(`__fbi.${member}.unbind();`);
+        copiedBack.push({ tmp, target: v });
+        settled.add(arg);
+        if (arg.name === undefined) positionalIndex++;
       } else if (paramName && !this.isOutputParam(fbTypeName, paramName)) {
         // An input reading the locked global reads it inside the lock, so the
         // call sees one consistent state of it.
@@ -7611,7 +7829,6 @@ export class CodeGenerator {
     // Values read out under the lock, stored to the caller's variables after.
     // A variable-length or function-block inout already wrote to the caller's
     // own storage, so it is not copied back.
-    const fbCpp = this.mapVarTypeToCpp(fbTypeName);
     const captures: Array<{ tmp: string; member: string; target: Expression }> =
       [];
     for (const arg of args) {
@@ -7663,15 +7880,19 @@ export class CodeGenerator {
     for (const input of inputs) {
       this.emit(`${inner}__fbi.${input.member} = ${input.code};`);
     }
+    for (const st of lockedBind) this.emit(`${inner}${st}`);
+    const unbound = this.omittedValueInouts(valueInouts, slotOf, fbTypeName);
     this.emitEnEnoWrapper(
       inner,
       en,
       null,
       (bi) => {
+        for (const m of unbound) this.emit(`${bi}__fbi.${m}.require();`);
         this.emitPOUCallLine("__fbi", call.functionName, bi);
       },
       "__fbi.ENO",
     );
+    for (const st of lockedAfter) this.emit(`${inner}${st}`);
     for (const b of lockedBack) {
       this.emit(`${inner}${b.lv} = __fbi.${b.member};`);
     }
@@ -7689,6 +7910,11 @@ export class CodeGenerator {
     }
     for (const c of captures) {
       this.emitCaptureToLvalue(c.target, c.tmp, indent);
+    }
+    for (const c of copiedBack) {
+      if (!this.emitBitCapture(c.target, c.tmp, indent)) {
+        this.emitCaptureToLvalue(c.target, c.tmp, indent);
+      }
     }
   }
 
@@ -7816,6 +8042,23 @@ export class CodeGenerator {
     const refs = this.fbRefInoutParams.get(upper);
     const vlas = this.fbVlaInoutParams.get(upper);
     return new Set([...all].filter((n) => !refs?.has(n) && !vlas?.has(n)));
+  }
+
+  /**
+   * The value in-outs of a call's block that no argument of the call fills, as
+   * the block's members. The call works on the binding an earlier call stored
+   * (IEC 61131-3 §6.6.3.4.1), so it checks there is one.
+   */
+  private omittedValueInouts(
+    valueInouts: Set<string>,
+    slotOf: Map<Argument, string>,
+    fbTypeName: string | undefined,
+  ): string[] {
+    if (valueInouts.size === 0) return [];
+    const given = new Set([...slotOf.values()].map((n) => n.toUpperCase()));
+    return [...valueInouts]
+      .filter((n) => !given.has(n))
+      .map((n) => this.fbParamMemberName(n, fbTypeName));
   }
 
   /**

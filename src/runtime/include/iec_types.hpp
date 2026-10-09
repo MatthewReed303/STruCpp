@@ -50,6 +50,27 @@
 #include <concepts>
 #endif
 
+/**
+ * True while the compiler evaluates a constant expression (C++20's
+ * std::is_constant_evaluated). Lets a constexpr constructor build a variable's
+ * initial value at compile time — so a STRUCT's defaults become a data image
+ * rather than code — while the same constructor at run time keeps its usual
+ * path. GCC 9+ / Clang 9+ have the builtin in every -std mode; elsewhere it is
+ * false and those initial values are built at run time, as before.
+ */
+#if defined(__clang__)
+#  if defined(__has_builtin)
+#    if __has_builtin(__builtin_is_constant_evaluated)
+#      define STRUCPP_CONSTANT_EVALUATED() __builtin_is_constant_evaluated()
+#    endif
+#  endif
+#elif defined(__GNUC__) && (__GNUC__ >= 9)
+#  define STRUCPP_CONSTANT_EVALUATED() __builtin_is_constant_evaluated()
+#endif
+#ifndef STRUCPP_CONSTANT_EVALUATED
+#  define STRUCPP_CONSTANT_EVALUATED() false
+#endif
+
 namespace strucpp {
 
 // =============================================================================

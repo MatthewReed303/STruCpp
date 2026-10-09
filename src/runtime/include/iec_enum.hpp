@@ -48,7 +48,7 @@ public:
     constexpr EnumType get() const noexcept { return value_; }
     
     // Assignment from enum value
-    IEC_ENUM_Value& operator=(EnumType val) noexcept {
+    constexpr IEC_ENUM_Value& operator=(EnumType val) noexcept {
         value_ = val;
         return *this;
     }
@@ -94,6 +94,31 @@ public:
 };
 
 /**
+ * A data type with named values (IEC 61131-3 Ed.3 6.4.4.3). Codegen emits one
+ * as an unscoped enum, which converts to its base integer, because its values
+ * are values of the base type; an enumeration (6.4.4.2) is a scoped enum.
+ */
+template<typename E, bool = std::is_enum<E>::value>
+struct is_iec_named_values : std::false_type {};
+
+template<typename E>
+struct is_iec_named_values<E, true>
+    : std::integral_constant<bool,
+          std::is_convertible<E, typename std::underlying_type<E>::type>::value> {};
+
+/** A number a variable of named-values type `E` may be assigned (6.4.4.3):
+ *  an arithmetic value, or a variable holding one. Not an enumerated value. */
+template<typename E, typename S, typename = void>
+struct is_iec_named_values_source : std::false_type {};
+
+template<typename E, typename S>
+struct is_iec_named_values_source<E, S,
+    typename std::enable_if<is_iec_named_values<E>::value && !std::is_enum<S>::value &&
+                            !std::is_convertible<S, E>::value &&
+                            std::is_convertible<S, typename std::underlying_type<E>::type>::value>::type>
+    : std::true_type {};
+
+/**
  * IEC enumeration variable with forcing support.
  * Wraps IEC_ENUM_Value in IECVar for debugging capabilities.
  *
@@ -111,47 +136,53 @@ private:
     value_type forced_value_;
     
 public:
-    IEC_ENUM_Var() noexcept : value_{}, forced_{false}, forced_value_{} {}
+    constexpr IEC_ENUM_Var() noexcept : value_{}, forced_{false}, forced_value_{} {}
 
     // Non-explicit so raw `EnumType` values can implicitly convert at call
     // sites — matches the implicit `IECVar(T v)` constructor for elementary
     // types. Without this, codegen would have to wrap every raw enum
     // literal at the call site, since enum-typed variables are now
     // declared as `IEC_<name>` (= IEC_ENUM_Var<EnumType>).
-    IEC_ENUM_Var(EnumType val) noexcept
+    constexpr IEC_ENUM_Var(EnumType val) noexcept
         : value_{val}, forced_{false}, forced_value_{} {}
 
-    IEC_ENUM_Var(value_type val) noexcept
+    constexpr IEC_ENUM_Var(value_type val) noexcept
         : value_{val}, forced_{false}, forced_value_{} {}
+
+    // Named values: any value of the base type (6.4.4.3), e.g. `x := 27`.
+    template<typename S, typename std::enable_if<
+        is_iec_named_values_source<EnumType, S>::value && std::is_arithmetic<S>::value, int>::type = 0>
+    constexpr IEC_ENUM_Var(S v) noexcept
+        : value_{static_cast<EnumType>(v)}, forced_{false}, forced_value_{} {}
     
     // Same contract as IECVar: a fresh instance starts unforced, and assigning
     // FROM another goes through set() so the destination's force survives. A
     // memberwise copy would unforce what the debugger holds, every cycle.
-    IEC_ENUM_Var(const IEC_ENUM_Var& other) noexcept
+    constexpr IEC_ENUM_Var(const IEC_ENUM_Var& other) noexcept
         : value_{other.get()}, forced_{false}, forced_value_{} {}
-    IEC_ENUM_Var(IEC_ENUM_Var&& other) noexcept
+    constexpr IEC_ENUM_Var(IEC_ENUM_Var&& other) noexcept
         : value_{other.get()}, forced_{false}, forced_value_{} {}
-    IEC_ENUM_Var& operator=(const IEC_ENUM_Var& other) noexcept {
+    constexpr IEC_ENUM_Var& operator=(const IEC_ENUM_Var& other) noexcept {
         set(other.get());
         return *this;
     }
-    IEC_ENUM_Var& operator=(IEC_ENUM_Var&& other) noexcept {
+    constexpr IEC_ENUM_Var& operator=(IEC_ENUM_Var&& other) noexcept {
         set(other.get());
         return *this;
     }
     
     // Get current value (returns forced value if forced)
-    STRUCPP_ACCESSOR value_type get() const noexcept {
+    STRUCPP_ACCESSOR constexpr value_type get() const noexcept {
         return forced_ ? forced_value_ : value_;
     }
     
     // Ignored while forced, so a force stays authoritative against the
     // program's own writes — the same guard IECVar::set carries.
-    STRUCPP_ACCESSOR void set(value_type v) noexcept {
+    STRUCPP_ACCESSOR constexpr void set(value_type v) noexcept {
         if (!forced_) { value_ = v; }
     }
     
-    STRUCPP_ACCESSOR void set(EnumType v) noexcept {
+    STRUCPP_ACCESSOR constexpr void set(EnumType v) noexcept {
         if (!forced_) { value_ = v; }
     }
     
@@ -211,25 +242,56 @@ public:
     }
     
     // Implicit conversion to value_type
-    operator value_type() const noexcept {
+    constexpr operator value_type() const noexcept {
         return get();
     }
     
     // Implicit conversion to enum_type
-    operator EnumType() const noexcept {
+    constexpr operator EnumType() const noexcept {
         return get().get();
     }
     
     // Assignment operators
-    IEC_ENUM_Var& operator=(value_type v) noexcept {
+    constexpr IEC_ENUM_Var& operator=(value_type v) noexcept {
         set(v);
         return *this;
     }
     
-    IEC_ENUM_Var& operator=(EnumType v) noexcept {
+    constexpr IEC_ENUM_Var& operator=(EnumType v) noexcept {
         set(v);
         return *this;
     }
+
+    // Named values: a number or an expression of the base type (6.4.4.3).
+    template<typename S, typename std::enable_if<
+        is_iec_named_values_source<EnumType, S>::value, int>::type = 0>
+    constexpr IEC_ENUM_Var& operator=(const S& v) noexcept {
+        set(static_cast<EnumType>(static_cast<typename std::underlying_type<EnumType>::type>(v)));
+        return *this;
+    }
+
+    // Named values compared with a number: exact matches, so they win over the
+    // built-in comparisons the implicit conversions would otherwise tie with.
+#define STRUCPP_NAMED_VALUES_CMP(OP)                                                   \
+    template<typename S, typename std::enable_if<                                      \
+        is_iec_named_values_source<EnumType, S>::value && std::is_arithmetic<S>::value, \
+        int>::type = 0>                                                                \
+    friend bool operator OP(const IEC_ENUM_Var& a, S b) noexcept {                     \
+        return static_cast<EnumType>(a.get()) OP b;                                    \
+    }                                                                                  \
+    template<typename S, typename std::enable_if<                                      \
+        is_iec_named_values_source<EnumType, S>::value && std::is_arithmetic<S>::value, \
+        int>::type = 0>                                                                \
+    friend bool operator OP(S a, const IEC_ENUM_Var& b) noexcept {                     \
+        return a OP static_cast<EnumType>(b.get());                                    \
+    }
+    STRUCPP_NAMED_VALUES_CMP(==)
+    STRUCPP_NAMED_VALUES_CMP(!=)
+    STRUCPP_NAMED_VALUES_CMP(<)
+    STRUCPP_NAMED_VALUES_CMP(>)
+    STRUCPP_NAMED_VALUES_CMP(<=)
+    STRUCPP_NAMED_VALUES_CMP(>=)
+#undef STRUCPP_NAMED_VALUES_CMP
     
     // Comparison operators
     bool operator==(const IEC_ENUM_Var& other) const noexcept {
@@ -378,19 +440,16 @@ inline std::ostream& operator<<(std::ostream& os, const IEC_ENUM_Var<EnumType>& 
  */
 
 /*
- * Example typed enumeration (IEC v3):
+ * Example data type with named values (IEC 61131-3 Ed.3 6.4.4.3):
  *
  * ST Source:
  *   TYPE Status : INT (IDLE := 0, RUNNING := 1, ERROR := -1); END_TYPE
  *
- * Generated C++:
- *   enum class Status : int16_t {
- *       IDLE = 0,
- *       RUNNING = 1,
- *       ERROR = -1
- *   };
- *   using Status_Value = IEC_ENUM_Value<Status>;
- *   using Status_Var = IEC_ENUM_Var<Status>;
+ * Generated C++ (unscoped, so a value converts to the base integer; the
+ * struct keeps the names qualified):
+ *   struct Status__NAMED { enum Status : INT_t { IDLE = 0, RUNNING = 1, ERROR = -1 }; };
+ *   using Status = Status__NAMED::Status;
+ *   using IEC_Status = IEC_ENUM<Status>;
  */
 
 
