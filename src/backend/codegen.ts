@@ -702,6 +702,41 @@ export class CodeGenerator {
    *  whose name appears in `reachable` are emitted; the array order
    *  matches the library's `chunks[]` declaration order so symbol
    *  layout in the user's `generated.hpp` is stable across builds. */
+  /** Library chunks held back until the program blocks they hold are
+   *  declared (see the library emission in the header), and those blocks. */
+  private deferredLibraryChunks: Array<{
+    library: string;
+    chunk: LibraryChunk;
+  }> = [];
+  private deferredNeeds = new Set<string>();
+
+  /** The program function blocks the held-back library chunks need, with
+   *  everything those hold or extend (names upper case). */
+  private deferredClosure(): Set<string> {
+    const byName = new Map(
+      this.sortedFBs.map((fb) => [fb.name.toUpperCase(), fb]),
+    );
+    const out = new Set<string>();
+    const stack = [...this.deferredNeeds];
+    while (stack.length > 0) {
+      const name = stack.pop()!;
+      if (out.has(name) || !byName.has(name)) continue;
+      out.add(name);
+      const fb = byName.get(name)!;
+      for (const block of fb.varBlocks) {
+        for (const decl of block.declarations) {
+          const t = decl.type.name.toUpperCase();
+          if (byName.has(t)) stack.push(t);
+          for (const held of this.fbBearingTypeDeps.get(t) ?? []) {
+            if (byName.has(held)) stack.push(held);
+          }
+        }
+      }
+      if (fb.extends) stack.push(fb.extends.toUpperCase());
+    }
+    return out;
+  }
+
   private libraryEmissions: Array<{
     archive: StlibArchive;
     reachable: Set<string>;
@@ -1895,6 +1930,52 @@ export class CodeGenerator {
     // chunk-array order; types come first, FBs next, functions last
     // because that's the order the library compiler emitted them
     // before slicing.
+    //
+    // A chunk that holds a function block of the program by value - a
+    // library's C/C++ block, which the consumer grafts into the program as a
+    // POU of its own and which therefore has no chunk - cannot come before
+    // that block's class: it is held back (its forward decl stays here) and
+    // emitted after the program blocks it needs (deferredLibraryChunks).
+    this.deferredLibraryChunks = [];
+    this.deferredNeeds = new Set<string>();
+    const userFbNames = new Set(
+      ast.functionBlocks.map((fb) => fb.name.toUpperCase()),
+    );
+    const chunkNames = new Set<string>();
+    for (const { archive } of this.libraryEmissions) {
+      for (const chunk of archive.chunks ?? [])
+        chunkNames.add(chunk.name.toUpperCase());
+    }
+    const deferredNames = new Set<string>();
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const { archive, reachable } of this.libraryEmissions) {
+        for (const chunk of archive.chunks ?? []) {
+          const name = chunk.name.toUpperCase();
+          if (
+            !reachable.has(chunk.name) ||
+            deferredNames.has(name) ||
+            chunk.header.length === 0
+          )
+            continue;
+          let defer = false;
+          for (const dep of chunk.deps ?? []) {
+            const d = dep.name.toUpperCase();
+            if (userFbNames.has(d) && !chunkNames.has(d)) {
+              this.deferredNeeds.add(d);
+              defer = true;
+            } else if (deferredNames.has(d)) {
+              defer = true;
+            }
+          }
+          if (defer) {
+            deferredNames.add(name);
+            changed = true;
+          }
+        }
+      }
+    }
+
     for (const { archive, reachable } of this.libraryEmissions) {
       const reachableChunks: LibraryChunk[] = [];
       for (const chunk of archive.chunks ?? []) {
@@ -1912,6 +1993,13 @@ export class CodeGenerator {
       }
 
       for (const chunk of reachableChunks) {
+        if (deferredNames.has(chunk.name.toUpperCase())) {
+          this.deferredLibraryChunks.push({
+            library: archive.manifest.name,
+            chunk,
+          });
+          continue;
+        }
         for (const line of chunk.header.split("\n")) {
           this.emitHeader(line);
         }
@@ -1935,14 +2023,39 @@ export class CodeGenerator {
     // VAR_EXTERNAL pointer to a global) can name them.
     this.emitFileScopeGlobals("early");
 
-    // Generate function block class declarations (topologically sorted by dependency)
+    // Generate function block class declarations (topologically sorted by
+    // dependency). The program blocks the held-back library chunks need (and
+    // what those need) come first, then those chunks, then the rest - which
+    // may hold the chunks' blocks.
     const emittedFBs = new Set<string>();
-    for (const fb of this.sortedFBs) {
+    const early = this.deferredClosure();
+    const emitFb = (fb: (typeof this.sortedFBs)[0]): void => {
       this.emitHeaderChunkMarker("begin", "functionBlock", fb.name);
       this.generateFBHeaderDeclaration(fb);
       this.emitHeaderChunkMarker("end", "functionBlock", fb.name);
       emittedFBs.add(fb.name.toUpperCase());
       this.emitFbBearingTypes(emittedFBs);
+    };
+    for (const fb of this.sortedFBs) {
+      if (early.has(fb.name.toUpperCase())) emitFb(fb);
+    }
+    if (this.deferredLibraryChunks.length > 0) {
+      let lib = "";
+      for (const { library, chunk } of this.deferredLibraryChunks) {
+        if (library !== lib) {
+          this.emitHeader(
+            `// Library: ${library} (after the program blocks it holds)`,
+          );
+          lib = library;
+        }
+        for (const line of chunk.header.split("\n")) {
+          this.emitHeader(line);
+        }
+      }
+      this.emitHeader("");
+    }
+    for (const fb of this.sortedFBs) {
+      if (!early.has(fb.name.toUpperCase())) emitFb(fb);
     }
     // Anything still held back names a block that never arrived; emit it rather
     // than drop it, and let the compiler report the missing type.

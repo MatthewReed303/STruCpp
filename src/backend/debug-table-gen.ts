@@ -1199,6 +1199,22 @@ export function generateDebugTable(
           (flags & WALK_RETAINED_ONLY) !== 0 &&
           (flags & LEAF_FLAG_RETAIN) === 0;
         for (const v of retainedOnly ? [] : interfaceVars) {
+          // A function block passed as an in-out is a pointer at someone
+          // else's instance (as for a user block below): debugged at its own
+          // name, never followed with `.member` through the pointer.
+          if (
+            v.isInOut &&
+            (isFunctionBlockTypeName(v.declaration.type.name) ||
+              symbolTables.lookupFunctionBlock(v.declaration.type.name) !==
+                undefined)
+          ) {
+            skipped.push({
+              path: `${path}.${v.name.toUpperCase()}`,
+              reason:
+                "function block in-out: an alias, debugged at its own name",
+            });
+            continue;
+          }
           if (
             v.isInOut &&
             fbSym.inoutsByReference === true &&
