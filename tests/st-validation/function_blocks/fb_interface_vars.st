@@ -1,0 +1,89 @@
+INTERFACE I_MOTOR_BASE
+  METHOD Id : INT
+  END_METHOD
+END_INTERFACE
+
+INTERFACE I_MOTOR EXTENDS I_MOTOR_BASE
+  METHOD IsRunning : BOOL
+  END_METHOD
+  METHOD Start
+    VAR_INPUT Speed : REAL; END_VAR
+  END_METHOD
+END_INTERFACE
+
+INTERFACE I_SPEED EXTENDS I_MOTOR_BASE
+  METHOD Speed : REAL
+  END_METHOD
+END_INTERFACE
+
+FUNCTION_BLOCK MotorDol IMPLEMENTS I_MOTOR
+  VAR running : BOOL; END_VAR
+  METHOD PUBLIC Id : INT
+    Id := 1;
+  END_METHOD
+  METHOD PUBLIC IsRunning : BOOL
+    IsRunning := running;
+  END_METHOD
+  METHOD PUBLIC Start
+    VAR_INPUT Speed : REAL; END_VAR
+    running := TRUE;
+  END_METHOD
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK MotorVsd IMPLEMENTS I_MOTOR, I_SPEED
+  VAR spd : REAL; END_VAR
+  METHOD PUBLIC Id : INT
+    Id := 2;
+  END_METHOD
+  METHOD PUBLIC IsRunning : BOOL
+    IsRunning := spd > 0.0;
+  END_METHOD
+  METHOD PUBLIC Start
+    VAR_INPUT Speed : REAL; END_VAR
+    spd := Speed;
+  END_METHOD
+  METHOD PUBLIC Speed : REAL
+    Speed := spd;
+  END_METHOD
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK MotorVsdFast EXTENDS MotorVsd
+  METHOD PUBLIC OVERRIDE Id : INT
+    Id := 3;
+  END_METHOD
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Pump
+  VAR_INPUT Demand : BOOL; Motor : I_MOTOR; END_VAR
+  VAR_OUTPUT Run : BOOL; Valid : BOOL; END_VAR
+  Valid := Motor <> NULL;
+  IF NOT Valid THEN
+    Run := FALSE;
+    RETURN;
+  END_IF;
+  IF Demand THEN Motor.Start(Speed := 50.0); END_IF;
+  Run := Motor.IsRunning();
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Station
+  VAR_IN_OUT Motors : ARRAY[*] OF I_MOTOR; END_VAR
+  VAR_OUTPUT Running : INT; IdSum : INT; END_VAR
+  VAR i : DINT; END_VAR
+  Running := 0;
+  IdSum := 0;
+  FOR i := LOWER_BOUND(Motors, 1) TO UPPER_BOUND(Motors, 1) DO
+    IF Motors[i] <> NULL THEN
+      IdSum := IdSum + Motors[i].Id();
+      IF Motors[i].IsRunning() THEN Running := Running + 1; END_IF;
+    END_IF;
+  END_FOR;
+END_FUNCTION_BLOCK
+
+FUNCTION MotorId : INT
+  VAR_INPUT m : I_MOTOR_BASE; END_VAR
+  IF m = NULL THEN
+    MotorId := -1;
+  ELSE
+    MotorId := m.Id();
+  END_IF;
+END_FUNCTION

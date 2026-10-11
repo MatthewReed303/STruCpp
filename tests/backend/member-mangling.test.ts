@@ -32,6 +32,13 @@ function build(source: string): { header: string; cpp: string } {
 }
 
 /** The constructor initializer-list line for a program. */
+/** The messages of a compile IEC 61131-3 refuses. */
+function refused(source: string): string {
+  const result = compile(source);
+  expect(result.success).toBe(false);
+  return result.errors.map((e) => e.message).join("\n");
+}
+
 function initList(cpp: string): string {
   return cpp.split("\n").find((l) => l.trimStart().startsWith(": ")) ?? "";
 }
@@ -65,19 +72,13 @@ END_PROGRAM`);
     expect(initList(cpp)).toContain("RANGE1_(");
   });
 
-  it("leaves an initialised elementary-named member unmangled in both places", () => {
-    const { header, cpp } = build(`
+  it("refuses an elementary-named member (IEC 61131-3 6.1.3, Table 10)", () => {
+    const messages = refused(`
 PROGRAM Main
 VAR Time : TIME := T#5s; Word : WORD := 16#FF; END_VAR
   Word := Word;
 END_PROGRAM`);
-    expect(header).toContain("IEC_TIME TIME;");
-    expect(header).toContain("IEC_WORD WORD;");
-    const inits = initList(cpp);
-    expect(inits).toContain("TIME(");
-    expect(inits).toContain("WORD(");
-    expect(inits).not.toContain("TIME_(");
-    expect(inits).not.toContain("WORD_(");
+    expect(messages).toMatch(/'Time' is a keyword[\s\S]*'Word' is a keyword/);
   });
 
   it("already agreed for a FUNCTION_BLOCK member, and still does", () => {
@@ -108,16 +109,14 @@ END_PROGRAM`);
     expect(cpp).toContain("MOTOR_.SPINNING");
   });
 
-  it("leaves an elementary-named member alone in the body", () => {
-    const { header, cpp } = build(`
+  it("refuses an elementary-named member used in the body (IEC 61131-3 6.1.3)", () => {
+    const messages = refused(`
 PROGRAM Main
 VAR Word : WORD; n : INT; END_VAR
   Word := WORD#7;
   n := n + 1;
 END_PROGRAM`);
-    expect(header).toContain("IEC_WORD WORD;");
-    expect(cpp).toContain("WORD = ");
-    expect(cpp).not.toContain("WORD_");
+    expect(messages).toMatch(/'Word' is a keyword/);
   });
 });
 
@@ -148,26 +147,20 @@ END_PROGRAM`);
     expect(header).toContain("MOTOR MOTOR_");
   });
 
-  it("leaves an elementary-named struct field alone", () => {
-    const { header } = build(`
+  it("refuses an elementary-named struct field (IEC 61131-3 6.1.3)", () => {
+    const messages = refused(`
 TYPE Bag : STRUCT Time : TIME; Word : WORD; END_STRUCT; END_TYPE
 PROGRAM Main
 VAR b : Bag; END_VAR
   b.Word := 16#FF;
 END_PROGRAM`);
-    expect(header).toContain("IEC_TIME TIME");
-    expect(header).toContain("IEC_WORD WORD");
-    // The mangled DECLARATION, not the bare substring: the layout table beside
-    // the struct legitimately says `sizeof(TIME_t)`, and a "TIME_" match would
-    // read that as a renamed field.
-    expect(header).not.toContain("IEC_TIME TIME_");
-    expect(header).not.toContain("IEC_WORD WORD_");
+    expect(messages).toMatch(/'Time' is a keyword[\s\S]*'Word' is a keyword/);
   });
 });
 
 describe("interface method collision", () => {
-  it("mangles the variable, leaving the method to own the name", () => {
-    const { header, cpp } = build(`
+  it("refuses a variable named like an implemented interface method (IEC 61131-3 6.6.5.5.5 rule 2)", () => {
+    const messages = refused(`
 INTERFACE IMotor
   METHOD Start : BOOL
   END_METHOD
@@ -183,10 +176,7 @@ PROGRAM Main
 VAR d : Drive; END_VAR
   d();
 END_PROGRAM`);
-    expect(header).toContain("IEC_BOOL START_;");
-    expect(header).toContain("virtual IEC_BOOL START();");
-    // The initialiser names the variable, not the method.
-    expect(cpp).toContain("START_(");
+    expect(messages).toMatch(/Variable 'Start' of 'DRIVE' has the name of a method/);
   });
 });
 
@@ -231,8 +221,8 @@ END_PROGRAM`);
     expect(cpp).toContain("S.READING_ = INP;");
   });
 
-  it("mangles an input colliding with an implemented interface method", () => {
-    const { header, cpp } = build(`
+  it("refuses an input named like an implemented interface method (IEC 61131-3 6.6.5.5.5 rule 2)", () => {
+    const messages = refused(`
 INTERFACE IProbe
   METHOD Arm : BOOL
   END_METHOD
@@ -249,10 +239,7 @@ PROGRAM Main
 VAR s : Sensor; END_VAR
   s(Arm := TRUE, gain := 2.0);
 END_PROGRAM`);
-    expect(header).toContain("IEC_BOOL ARM_;");
-    expect(cpp).toContain("S.ARM_ = true;");
-    // A non-colliding sibling is untouched.
-    expect(cpp).toContain("S.GAIN = 2.0;");
+    expect(messages).toMatch(/Variable 'Arm' of 'SENSOR' has the name of a method/);
   });
 
   it("mangles the VAR_IN_OUT copy-back and the => output capture", () => {
@@ -275,8 +262,8 @@ END_PROGRAM`);
     expect(cpp).toContain("GOT = S.READING_;");
   });
 
-  it("leaves an elementary-named FB input alone", () => {
-    const { header, cpp } = build(`
+  it("refuses an elementary-named FB input (IEC 61131-3 6.1.3)", () => {
+    const messages = refused(`
 FUNCTION_BLOCK Sensor
 VAR_INPUT Time : TIME; END_VAR
 VAR_OUTPUT o : TIME; END_VAR
@@ -286,8 +273,6 @@ PROGRAM Main
 VAR s : Sensor; END_VAR
   s(Time := T#1s);
 END_PROGRAM`);
-    expect(header).toContain("IEC_TIME TIME;");
-    expect(cpp).toContain("S.TIME = ");
-    expect(cpp).not.toContain("S.TIME_");
+    expect(messages).toMatch(/'Time' is a keyword/);
   });
 });

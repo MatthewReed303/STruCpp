@@ -92,11 +92,11 @@ ${prints}
     // The whole fix hangs off these. Traceable to the vendor's own pages, so
     // a future reader can check the expectation rather than trust it.
     const out = run(
-      `    dt : DT   := DT#2019-09-01-12:00:00;
+      `    dtv : DT  := DT#2019-09-01-12:00:00;
     dd : DATE := DATE#1970-01-02;
     td : TOD  := TOD#12:00:00;
     a : DINT; b : DINT; c : DINT;`,
-      `  a := DT_TO_DINT(dt);
+      `  a := DT_TO_DINT(dtv);
   b := DATE_TO_DINT(dd);
   c := TOD_TO_DINT(td);`,
       `    // The three day constants used to be three private copies. They are

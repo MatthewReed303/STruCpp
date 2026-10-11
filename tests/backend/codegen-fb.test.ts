@@ -410,3 +410,92 @@ describe("Codegen - Function Blocks", () => {
     });
   });
 });
+
+describe("Codegen - function block body binding, temporaries, edge inputs", () => {
+  it("binds the body dynamically unless the block is FINAL with no base (IEC 6.6.7.2.9 rule 4)", () => {
+    const result = compileAndCheck(`
+      FUNCTION_BLOCK Base VAR_OUTPUT x : INT; END_VAR x := 1; END_FUNCTION_BLOCK
+      FUNCTION_BLOCK FINAL Leaf EXTENDS Base SUPER(); x := x + 1; END_FUNCTION_BLOCK
+      FUNCTION_BLOCK FINAL Alone VAR_OUTPUT y : INT; END_VAR y := 2; END_FUNCTION_BLOCK
+      PROGRAM Main END_PROGRAM
+    `);
+    const header = result.headerCode;
+    const cls = (name: string): string =>
+      header.slice(
+        header.indexOf(`class ${name} `),
+        header.indexOf("};", header.indexOf(`class ${name} `)),
+      );
+    expect(cls("BASE")).toContain("virtual void operator()();");
+    expect(cls("LEAF")).toContain("virtual void operator()();");
+    expect(cls("ALONE")).toContain("    void operator()();");
+    expect(cls("ALONE")).not.toContain("virtual void operator()");
+    expect(result.cppCode).toContain("BASE::operator()()");
+  });
+
+  it("declares VAR_TEMP as locals of the body, initialised at each call (IEC 6.5.2.1)", () => {
+    const result = compileAndCheck(`
+      FUNCTION_BLOCK Fb
+        VAR_OUTPUT y : INT; END_VAR
+        VAR_TEMP t : INT; u : INT := 5; END_VAR
+        t := t + u; y := t;
+      END_FUNCTION_BLOCK
+      PROGRAM Main END_PROGRAM
+    `);
+    const header = result.headerCode;
+    const cls = header.slice(
+      header.indexOf("class FB "),
+      header.indexOf("};", header.indexOf("class FB ")),
+    );
+    expect(cls).not.toMatch(/IEC_INT T;|IEC_INT U;/);
+    const body = result.cppCode.slice(result.cppCode.indexOf("void FB::operator()()"));
+    expect(body).toContain("IEC_INT T;");
+    expect(body).toContain("IEC_INT U = 5;");
+  });
+
+  it("declares a PROGRAM's VAR_TEMP as locals of run(), initialised at each call (IEC 6.5.2.1)", () => {
+    const result = compileAndCheck(`
+      PROGRAM Main
+        VAR n : INT; END_VAR
+        VAR_TEMP t : INT; u : INT := 5; END_VAR
+        t := t + u; n := n + t;
+      END_PROGRAM
+      CONFIGURATION Config0
+        RESOURCE Res0 ON PLC
+          TASK task0(INTERVAL := T#20ms, PRIORITY := 0);
+          PROGRAM instance0 WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `);
+    const header = result.headerCode;
+    const cls = header.slice(
+      header.indexOf("class Program_MAIN "),
+      header.indexOf("};", header.indexOf("class Program_MAIN ")),
+    );
+    expect(cls).toContain("IEC_INT N;");
+    expect(cls).not.toMatch(/IEC_INT T;|IEC_INT U;/);
+    expect(result.cppCode).not.toMatch(/\bU\(5\)/);
+    const body = result.cppCode.slice(result.cppCode.indexOf("void Program_MAIN::run()"));
+    expect(body).toContain("IEC_INT T;");
+    expect(body).toContain("IEC_INT U = 5;");
+  });
+
+  it("gives an edge input one hidden memory bit and a local holding the edge", () => {
+    const result = compileAndCheck(`
+      FUNCTION_BLOCK Fb
+        VAR_INPUT Go : BOOL R_EDGE; Halt : BOOL F_EDGE; END_VAR
+        VAR_OUTPUT n : INT; END_VAR
+        IF Go OR Halt THEN n := n + 1; END_IF;
+      END_FUNCTION_BLOCK
+      PROGRAM Main END_PROGRAM
+    `);
+    expect(result.headerCode).toContain("bool __edge_GO = false;");
+    expect(result.headerCode).toContain("bool __edge_HALT = false;");
+    expect(result.cppCode).toContain(
+      "const bool __edge_GO_q = this->GO.get() && !__edge_GO;",
+    );
+    expect(result.cppCode).toContain(
+      "const bool __edge_HALT_q = !this->HALT.get() && !__edge_HALT;",
+    );
+    expect(result.cppCode).toContain("IEC_BOOL GO(__edge_GO_q);");
+  });
+});

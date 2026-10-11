@@ -2,8 +2,9 @@
  * A variable named like a standard function.
  *
  * IEC 61131-3 keeps variables and functions in separate namespaces, so `sel`,
- * `limit`, `max`, `to_int` or `time` may name a variable while the POU still
- * calls SEL, LIMIT, MAX, TO_INT or TIME. In C++ the member or local hid the
+ * `limit`, `max` or `to_int` may name a variable while the POU still calls
+ * SEL, LIMIT, MAX or TO_INT (`time` may not: TIME is an elementary type
+ * keyword, IEC 61131-3 6.1.3 and Table 10). In C++ the member or local hid the
  * runtime function (`no match for call to (IEC_INT)(...)`); the generated
  * code now calls standard functions by their qualified name. The variables
  * keep their names, so the debugger sees the same paths.
@@ -53,7 +54,7 @@ VAR
   b : BOOL := TRUE;
   to_int : INT;
   r : REAL := 2.6;
-  time : TIME;
+  now : TIME;
   range : Range;
   w : Window;
   fromRange : INT;
@@ -62,7 +63,7 @@ END_VAR
   limit := LIMIT(0, sel * 30, 9);
   max := MAX(sel, limit);
   to_int := REAL_TO_INT(r);
-  time := TIME();
+  now := TIME();
   fromRange := LIMIT(range.min, 100, range.max);
   w(v := 7);
   clamped := Clamp(max := 5, v := -12);
@@ -101,7 +102,7 @@ describeIfGpp("variables named like standard functions", () => {
       "LIMIT",
       "MAX",
       "TO_INT",
-      "TIME",
+      "NOW",
       "RANGE.MIN",
       "W.MIN",
       "W.LEN",

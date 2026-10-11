@@ -496,7 +496,7 @@ int main() {
           2: dev.last := 0;
         END_CASE;
       END_PROGRAM
-      PROGRAM Single
+      PROGRAM SingleProg
         VAR_EXTERNAL dev : Plant; END_VAR
         VAR adder : AddOther; END_VAR
         adder(arr := dev.spare);
@@ -508,7 +508,7 @@ int main() {
           TASK t2(INTERVAL := T#10ms, PRIORITY := 1);
           PROGRAM instA WITH t1 : Worker;
           PROGRAM instB WITH t2 : Worker;
-          PROGRAM instC WITH t2 : Single;
+          PROGRAM instC WITH t2 : SingleProg;
         END_RESOURCE
       END_CONFIGURATION
     `;

@@ -16,6 +16,7 @@ import { compile } from "../index.js";
 import { buildChunks } from "./library-chunks.js";
 import type { MemberManglingContext } from "../backend/member-mangling.js";
 import {
+  fbMethodNamesByBlock,
   mangledMemberName,
   userDefinedTypeNames,
 } from "../backend/member-mangling.js";
@@ -27,13 +28,17 @@ import {
 } from "./native-sources.js";
 import type {
   LibraryFBEntry,
+  LibraryInterfaceEntry,
   LibraryManifest,
+  LibraryMethodEntry,
   LibraryStructField,
   LibraryVarType,
 } from "./library-manifest.js";
 import type {
   Expression,
   FunctionBlockDeclaration,
+  InterfaceDeclaration,
+  MethodDeclaration,
   TypeReference,
   VarBlock,
   VarDeclaration,
@@ -51,6 +56,14 @@ function serializeInitialValue(expr: Expression): string | undefined {
     case "LiteralExpression":
       return expr.rawValue;
     case "VariableExpression":
+      // A typed enumerated value, `E#Member`.
+      if (
+        expr.typedLiteral === true &&
+        expr.subscripts.length === 0 &&
+        expr.fieldAccess.length === 1
+      ) {
+        return `${expr.name}#${expr.fieldAccess[0]}`;
+      }
       // A bare named constant/enum used as a default (no subscripts/fields).
       return expr.subscripts.length === 0 &&
         expr.fieldAccess.length === 0 &&
@@ -150,12 +163,13 @@ function serializeLocal(
   if (cppName !== name) entry.cppName = cppName;
   if (block.isConstant) entry.readOnly = true;
   if (block.isRetain) entry.retain = true;
+  if (block.isNonRetain) entry.nonRetain = true;
   return entry;
 }
 
 /** Match a top-of-line POU header. */
 const POU_HEADER_RE =
-  /^[ \t]*(FUNCTION_BLOCK|FUNCTION|PROGRAM|TYPE)[ \t]+(\w+)/gm;
+  /^[ \t]*(FUNCTION_BLOCK|FUNCTION|PROGRAM|TYPE|INTERFACE)[ \t]+(?:(?:ABSTRACT|FINAL)[ \t]+)?(\w+)/gm;
 
 /**
  * Build a "POU name → category" map from categorized source inputs.
@@ -287,23 +301,149 @@ function emptyManifest(options: {
 }
 
 /**
+ * A block and the blocks of the same library it EXTENDS, base first. A base
+ * from elsewhere ends the chain.
+ */
+function fbLineage(
+  fb: FunctionBlockDeclaration,
+  all: readonly FunctionBlockDeclaration[],
+): FunctionBlockDeclaration[] {
+  const chain: FunctionBlockDeclaration[] = [];
+  let current: FunctionBlockDeclaration | undefined = fb;
+  while (current && !chain.includes(current)) {
+    chain.unshift(current);
+    const base: string | undefined = current.extends?.toUpperCase();
+    current =
+      base === undefined
+        ? undefined
+        : all.find((f) => f.name.toUpperCase() === base);
+  }
+  return chain;
+}
+
+/**
+ * The manifest entry of a block with the variables it inherits (IEC 61131-3
+ * 6.6.5.5.2 rule 2, 6.6.7.2.8) listed before its own, so a consumer sees the
+ * whole interface of a derived block without walking EXTENDS.
+ */
+function buildDerivedFBEntry(
+  fb: FunctionBlockDeclaration,
+  all: readonly FunctionBlockDeclaration[],
+  manglingOf?: (owner: FunctionBlockDeclaration) => MemberManglingContext,
+): LibraryFBEntry {
+  const lineage = fbLineage(fb, all);
+  const parts = lineage.map((owner) =>
+    buildFBEntry(owner, manglingOf?.(owner)),
+  );
+  const inouts = parts.flatMap((p) => p.inouts);
+  const methods = publicMethodsOf(lineage);
+  return {
+    name: fb.name,
+    inputs: parts.flatMap((p) => p.inputs),
+    outputs: parts.flatMap((p) => p.outputs),
+    inouts,
+    ...(inouts.length > 0 ? { inoutsByReference: true } : {}),
+    ...(fb.extends !== undefined ? { extends: fb.extends } : {}),
+    ...(fb.isAbstract ? { isAbstract: true } : {}),
+    ...(fb.isFinal ? { isFinal: true } : {}),
+    ...(fb.implements !== undefined && fb.implements.length > 0
+      ? { implements: [...fb.implements] }
+      : {}),
+    ...(methods.length > 0 ? { methods } : {}),
+  };
+}
+
+/**
+ * The PUBLIC methods a block offers to its callers (IEC 61131-3 6.6.5.4.4):
+ * those of its lineage, base first, a method of a derived block replacing the
+ * base's of the same name (OVERRIDE, 6.6.5.5.5).
+ */
+function publicMethodsOf(
+  lineage: readonly FunctionBlockDeclaration[],
+): LibraryMethodEntry[] {
+  const byName = new Map<string, LibraryMethodEntry>();
+  for (const owner of lineage) {
+    for (const method of owner.methods) {
+      const key = method.name.toUpperCase();
+      if (method.visibility !== "PUBLIC") {
+        byName.delete(key);
+        continue;
+      }
+      byName.set(key, buildMethodEntry(method));
+    }
+  }
+  return [...byName.values()];
+}
+
+/** The manifest entry of one method prototype. */
+function buildMethodEntry(method: MethodDeclaration): LibraryMethodEntry {
+  const params = (blockType: string): LibraryVarType[] =>
+    method.varBlocks
+      .filter((b) => b.blockType === blockType)
+      .flatMap((b) =>
+        b.declarations.flatMap((d) =>
+          d.names.map((n) => {
+            const entry = serializeVarType(n, d.type);
+            if (blockType === "VAR_INPUT" && d.initialValue !== undefined) {
+              const initial = serializeInitialValue(d.initialValue);
+              if (initial !== undefined) entry.initialValue = initial;
+            }
+            return entry;
+          }),
+        ),
+      );
+  return {
+    name: method.name,
+    ...(method.returnType !== undefined
+      ? { returnType: method.returnType.name }
+      : {}),
+    ...(typeof method.returnType?.maxLength === "number"
+      ? { returnMaxLength: method.returnType.maxLength }
+      : {}),
+    inputs: params("VAR_INPUT"),
+    outputs: params("VAR_OUTPUT"),
+    inouts: params("VAR_IN_OUT"),
+    ...(method.isAbstract ? { isAbstract: true } : {}),
+  };
+}
+
+/** The manifest entry of a library INTERFACE (IEC 61131-3 6.6.6). */
+function buildInterfaceEntry(
+  iface: InterfaceDeclaration,
+): LibraryInterfaceEntry {
+  return {
+    name: iface.name,
+    ...(iface.extends !== undefined && iface.extends.length > 0
+      ? { extends: [...iface.extends] }
+      : {}),
+    methods: iface.methods.map(buildMethodEntry),
+  };
+}
+
+/**
  * Build a manifest entry for one function block from its AST node.
  *
  * Shared by the ST pass and the native-header pass so both describe an
  * interface identically — the native path differs only in what it adds
  * afterwards (`implementation`, `sourceFile`).
  */
-function buildFBEntry(fb: {
-  name: string;
-  varBlocks: Array<{
-    blockType: string;
-    declarations: Array<{
-      names: string[];
-      type: TypeReference;
-      initialValue?: Expression;
+function buildFBEntry(
+  fb: {
+    name: string;
+    varBlocks: Array<{
+      blockType: string;
+      isRetain?: boolean;
+      isNonRetain?: boolean;
+      declarations: Array<{
+        names: string[];
+        type: TypeReference;
+        initialValue?: Expression;
+        edge?: "R_EDGE" | "F_EDGE";
+      }>;
     }>;
-  }>;
-}): LibraryFBEntry {
+  },
+  mangling?: MemberManglingContext,
+): LibraryFBEntry {
   const varsOfBlock = (blockType: string): LibraryVarType[] =>
     fb.varBlocks
       .filter((b) => b.blockType === blockType)
@@ -311,6 +451,19 @@ function buildFBEntry(fb: {
         b.declarations.flatMap((d) =>
           d.names.map((n) => {
             const entry = serializeVarType(n, d.type);
+            // The C++ member, when the library's codegen mangled it (a pin
+            // named like a method of the block) — see serializeLocal().
+            if (mangling !== undefined) {
+              const cppName = mangledMemberName(n, d.type.name, mangling);
+              if (cppName !== n) entry.cppName = cppName;
+            }
+            // `VAR_INPUT RETAIN` / `VAR_OUTPUT RETAIN` (6.5.6): retained in
+            // every instance, as a `VAR RETAIN` member is (serializeLocal).
+            if (b.isRetain === true) entry.retain = true;
+            // `VAR_INPUT NON_RETAIN`: kept out of a RETAIN instance (6.5.6.2).
+            if (b.isNonRetain === true) entry.nonRetain = true;
+            // `R_EDGE` / `F_EDGE` (6.6.3.2 item 13): tooling draws the marker.
+            if (d.edge !== undefined) entry.edge = d.edge;
             // An input's default, as function parameters carry theirs: it tells
             // tooling the pin may be left unwired (a block's `ENABLE := TRUE`).
             if (blockType === "VAR_INPUT" && d.initialValue !== undefined) {
@@ -619,25 +772,7 @@ export function compileLibrary(
   // place that knows which of its type names are user-defined and which
   // interface methods each block implements. See serializeLocal().
   const userTypes = userDefinedTypeNames(ast);
-  const ifaceMethods = new Map<string, Set<string>>();
-  {
-    const byInterface = new Map<string, Set<string>>();
-    for (const iface of ast.interfaces) {
-      byInterface.set(
-        iface.name.toUpperCase(),
-        new Set(iface.methods.map((m) => m.name.toUpperCase())),
-      );
-    }
-    for (const fb of ast.functionBlocks) {
-      if (!fb.implements || fb.implements.length === 0) continue;
-      const methods = new Set<string>();
-      for (const name of fb.implements) {
-        for (const m of byInterface.get(name.toUpperCase()) ?? [])
-          methods.add(m);
-      }
-      if (methods.size > 0) ifaceMethods.set(fb.name.toUpperCase(), methods);
-    }
-  }
+  const ifaceMethods = fbMethodNamesByBlock(ast);
   const manglingCtx = (
     fb: FunctionBlockDeclaration,
   ): MemberManglingContext => ({
@@ -705,20 +840,23 @@ export function compileLibrary(
         tagDocumentation(
           tagCategory(
             {
-              ...buildFBEntry(fb),
+              ...buildDerivedFBEntry(fb, ast.functionBlocks, manglingCtx),
               // The block's own VAR members, declared the same way the
               // interface arrays above are. A RETAINed instance retains these
               // too; without them a retained TON keeps Q and ET and loses the
-              // state that makes them mean anything.
-              locals: fb.varBlocks
-                .filter((b) => b.blockType === "VAR")
-                .flatMap((b) =>
-                  b.declarations.flatMap((d) =>
-                    d.names.map((n) =>
-                      serializeLocal(n, d, b, manglingCtx(fb)),
+              // state that makes them mean anything. A derived block also
+              // holds those of its bases (IEC 61131-3 6.6.5.5.2 rule 2).
+              locals: fbLineage(fb, ast.functionBlocks).flatMap((owner) =>
+                owner.varBlocks
+                  .filter((b) => b.blockType === "VAR")
+                  .flatMap((b) =>
+                    b.declarations.flatMap((d) =>
+                      d.names.map((n) =>
+                        serializeLocal(n, d, b, manglingCtx(owner)),
+                      ),
                     ),
                   ),
-                ),
+              ),
             },
             catByName,
           ),
@@ -739,6 +877,8 @@ export function compileLibrary(
         declaredName?: string;
         fields?: LibraryStructField[];
         members?: string[];
+        values?: Array<string | null>;
+        defaultValue?: string;
         baseType?: string;
       } = { name: t.name, kind };
       // Only when it says something the folded name does not, so an all-caps
@@ -750,6 +890,19 @@ export function compileLibrary(
       // them, but the symbol table is built from the manifest.
       if (t.definition.kind === "EnumDefinition") {
         entry.members = t.definition.members.map((m) => m.name);
+        // Explicit values (6.4.4.3) and the type's own initial value, so a
+        // consumer evaluates and initialises the type as the library does.
+        if (t.definition.members.some((m) => m.value !== undefined)) {
+          entry.values = t.definition.members.map((m) =>
+            m.value !== undefined
+              ? (serializeInitialValue(m.value) ?? null)
+              : null,
+          );
+        }
+        if (t.defaultValue !== undefined) {
+          const initial = serializeInitialValue(t.defaultValue);
+          if (initial !== undefined) entry.defaultValue = initial;
+        }
         // A data type with named values: a consumer types its values as the
         // base, and debugs it at the base's width.
         if (t.definition.baseType) {
@@ -773,6 +926,18 @@ export function compileLibrary(
       }
       return tagDocumentation(tagCategory(entry, catByName), docByName);
     }),
+    // Exported interfaces: a consumer declares variables of them, passes
+    // instances to interface-typed pins and calls their methods (6.6.6).
+    ...(ast.interfaces.length > 0
+      ? {
+          interfaces: ast.interfaces.map((i) =>
+            tagDocumentation(
+              tagCategory(buildInterfaceEntry(i), catByName),
+              docByName,
+            ),
+          ),
+        }
+      : {}),
     // Exported VAR_GLOBAL variables — their storage is emitted as inlineGlobal
     // chunks; this list lets consumers' analyzers resolve the symbols. Every
     // importing program merges all libraries' globals into one global scope.

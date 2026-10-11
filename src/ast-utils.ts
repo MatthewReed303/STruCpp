@@ -31,6 +31,7 @@ import type {
   ArrayDimension,
   AssignmentStatement,
   RefAssignStatement,
+  AssignmentAttemptStatement,
   IfStatement,
   ElsifClause,
   CaseStatement,
@@ -510,6 +511,12 @@ function getChildren(node: ASTNode): ASTNode[] {
     case "RefAssignStatement": {
       const ras = node as RefAssignStatement;
       children.push(ras.target, ras.source);
+      break;
+    }
+
+    case "AssignmentAttemptStatement": {
+      const aas = node as AssignmentAttemptStatement;
+      children.push(aas.target, aas.source);
       break;
     }
 

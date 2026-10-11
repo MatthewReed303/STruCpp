@@ -65,6 +65,9 @@ export interface VariableSymbol extends BaseSymbol {
   isExternal: boolean;
   isGlobal: boolean;
   isRetain: boolean;
+  /** A library block's member declared in a `NON_RETAIN` section: never
+   *  retained, even in a RETAIN instance (IEC 61131-3 6.5.6.2). */
+  isNonRetain?: boolean;
   address?: string | undefined;
   /** Default value as an ST expression string, for library function/FB
    *  parameters reconstructed from a manifest (whose `declaration` carries no
@@ -129,6 +132,12 @@ export interface FunctionBlockSymbol extends BaseSymbol {
    * archive, whose in-outs are plain copies.
    */
   inoutsByReference?: boolean;
+  /**
+   * The block a library block EXTENDS (`LibraryFBEntry.extends`). Its
+   * `inputs`, `outputs` and `inouts` already include the inherited ones, so
+   * this only answers "is it derived from", never where a member lives.
+   */
+  libraryExtends?: string;
 }
 
 /**

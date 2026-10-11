@@ -41,6 +41,7 @@ import type {
   AccessStep,
   AssignmentStatement,
   RefAssignStatement,
+  AssignmentAttemptStatement,
   RefExpression,
   DrefExpression,
   NewExpression,
@@ -195,6 +196,14 @@ function getFirstToken(
 /**
  * Get the first CST node from a children array.
  */
+/** The access specifier written on a VAR section (IEC 61131-3 §6.6.5.10). */
+function varBlockAccess(children: CstChildren): Visibility | undefined {
+  if (children.PUBLIC) return "PUBLIC";
+  if (children.PRIVATE) return "PRIVATE";
+  if (children.PROTECTED) return "PROTECTED";
+  return undefined;
+}
+
 function getFirstNode(
   items: (CstNode | IToken)[] | undefined,
 ): CstNode | undefined {
@@ -775,10 +784,11 @@ export class ASTBuilder {
     const nameToken = getAllTokens(children.Identifier)[0];
     const name = nameToken?.image ?? "";
 
-    // Visibility modifier
-    let visibility: Visibility = "PUBLIC";
-    if (children.PRIVATE) visibility = "PRIVATE";
-    else if (children.PROTECTED) visibility = "PROTECTED";
+    // Access specifier: PROTECTED when none is written (IEC 61131-3
+    // 6.6.5.4.3 rule 5, 6.6.5.9; for function blocks 6.6.7.2.5).
+    let visibility: Visibility = "PROTECTED";
+    if (children.PUBLIC) visibility = "PUBLIC";
+    else if (children.PRIVATE) visibility = "PRIVATE";
 
     // Modifiers
     const isAbstract = !!children.ABSTRACT;
@@ -840,6 +850,7 @@ export class ASTBuilder {
     // PERSISTENT is RETAIN here — see the note on `VarBlock.isRetain`.
     const isRetain = !!children.RETAIN || !!children.PERSISTENT;
     const isNonRetain = !!children.NON_RETAIN;
+    const access = varBlockAccess(children);
 
     const declarations: VarDeclaration[] = [];
     for (const declNode of getAllNodes(children.varDeclaration)) {
@@ -853,6 +864,7 @@ export class ASTBuilder {
       isConstant,
       isRetain,
       isNonRetain,
+      ...(access !== undefined ? { access } : {}),
       declarations,
     };
   }
@@ -1461,6 +1473,7 @@ export class ASTBuilder {
     // PERSISTENT is RETAIN here — see the note on `VarBlock.isRetain`.
     const isRetain = !!children.RETAIN || !!children.PERSISTENT;
     const isNonRetain = !!children.NON_RETAIN;
+    const access = varBlockAccess(children);
 
     const declarations: VarDeclaration[] = [];
     for (const declNode of getAllNodes(children.varDeclaration)) {
@@ -1474,6 +1487,7 @@ export class ASTBuilder {
       isConstant,
       isRetain,
       isNonRetain,
+      ...(access !== undefined ? { access } : {}),
       declarations,
     };
   }
@@ -1656,6 +1670,13 @@ export class ASTBuilder {
       }
     }
 
+    const edgeToken = getFirstToken(children.edgeQualifier);
+    const edge = edgeToken
+      ? edgeToken.image.toUpperCase() === "F_EDGE"
+        ? ("F_EDGE" as const)
+        : ("R_EDGE" as const)
+      : undefined;
+
     // Use conditional spreading for optional properties to comply with exactOptionalPropertyTypes
     return {
       kind: "VarDeclaration",
@@ -1668,6 +1689,9 @@ export class ASTBuilder {
       ...(addressKind !== undefined ? { addressKind } : {}),
       ...(addressSpan !== undefined ? { addressSpan } : {}),
       ...(nameSpans.length > 0 ? { nameSpans } : {}),
+      ...(edge !== undefined && edgeToken
+        ? { edge, edgeSpan: tokenToSourceSpan(edgeToken) }
+        : {}),
     };
   }
 
@@ -1895,6 +1919,11 @@ export class ASTBuilder {
         getFirstNode(children.refAssignStatement)!,
       );
     }
+    if (children.assignAttemptStatement) {
+      return this.buildAssignAttemptStatement(
+        getFirstNode(children.assignAttemptStatement)!,
+      );
+    }
     if (children.assignmentStatement) {
       // A chained assignment desugars into multiple statements; a plain one
       // returns a single node so existing single-statement callers still work.
@@ -1965,6 +1994,23 @@ export class ASTBuilder {
     }
 
     return undefined;
+  }
+
+  /** Build an AssignmentAttemptStatement (`target ?= source;`). */
+  buildAssignAttemptStatement(node: CstNode): AssignmentAttemptStatement {
+    const children = node.children as CstChildren;
+    const targetNode = getFirstNode(children.variable);
+    const sourceNode = getFirstNode(children.expression);
+    return {
+      kind: "AssignmentAttemptStatement",
+      sourceSpan: nodeToSourceSpan(node),
+      target: targetNode
+        ? this.buildVariableExpression(targetNode)
+        : this.createDummyVariable(node),
+      source:
+        (sourceNode ? this.buildExpression(sourceNode) : undefined) ??
+        this.createDummyVariable(node),
+    };
   }
 
   /**
@@ -3353,8 +3399,9 @@ export class ASTBuilder {
   buildThisAccessExpression(node: CstNode): Expression {
     const children = node.children as CstChildren;
 
-    // THIS^ (dereference - return self)
-    if (children.Caret) {
+    // THIS^ (dereference - return self). A bare THIS (IEC 61131-3 §6.6.5.7.2)
+    // names the same instance.
+    if (children.Caret || !children.Dot) {
       return {
         kind: "VariableExpression",
         sourceSpan: nodeToSourceSpan(node),
@@ -3466,12 +3513,33 @@ export class ASTBuilder {
     node: CstNode,
   ): FunctionCallExpression | MethodCallExpression {
     const children = node.children as CstChildren;
-    const idOrKwNodes = getAllNodes(children.identifierOrKeyword);
-    const instanceName = idOrKwNodes[0]
-      ? getIdentifierOrKeywordImage(idOrKwNodes[0])
-      : "";
-    const methodName = idOrKwNodes[1]
-      ? getIdentifierOrKeywordImage(idOrKwNodes[1])
+    let result = this.buildMethodCallBase(node);
+
+    // Build chained method calls as nested MethodCallExpression nodes
+    const chainedCalls = getAllNodes(children.chainedMethodCall);
+    for (const chainNode of chainedCalls) {
+      result = this.buildChainedCall(chainNode, result, node);
+    }
+
+    return result;
+  }
+
+  /**
+   * The first call of a methodCall / methodCallStatement node. `inst.M(…)`
+   * stays the dotted FunctionCallExpression "inst.M"; a method on a longer
+   * path (`units[i].M(…)`, `a.b.M(…)`) is a MethodCallExpression on it.
+   */
+  private buildMethodCallBase(
+    node: CstNode,
+  ): FunctionCallExpression | MethodCallExpression {
+    const children = node.children as CstChildren;
+    const objectNode = getFirstNode(children.variable);
+    const object = objectNode
+      ? this.buildVariableExpression(objectNode)
+      : this.createDummyVariable(node);
+    const methodNode = getFirstNode(children.identifierOrKeyword);
+    const methodName = methodNode
+      ? getIdentifierOrKeywordImage(methodNode)
       : "";
 
     const args: Argument[] = [];
@@ -3483,21 +3551,25 @@ export class ASTBuilder {
       }
     }
 
-    // Build the base method call as a FunctionCallExpression
-    let result: FunctionCallExpression | MethodCallExpression = {
-      kind: "FunctionCallExpression",
+    const isPlainName =
+      object.subscripts.length === 0 &&
+      object.fieldAccess.length === 0 &&
+      !object.isDereference;
+    if (isPlainName) {
+      return {
+        kind: "FunctionCallExpression",
+        sourceSpan: nodeToSourceSpan(node),
+        functionName: `${object.name}.${methodName}`,
+        arguments: args,
+      };
+    }
+    return {
+      kind: "MethodCallExpression",
       sourceSpan: nodeToSourceSpan(node),
-      functionName: `${instanceName}.${methodName}`,
+      object,
+      methodName,
       arguments: args,
     };
-
-    // Build chained method calls as nested MethodCallExpression nodes
-    const chainedCalls = getAllNodes(children.chainedMethodCall);
-    for (const chainNode of chainedCalls) {
-      result = this.buildChainedCall(chainNode, result, node);
-    }
-
-    return result;
   }
 
   /**
@@ -3659,30 +3731,7 @@ export class ASTBuilder {
    */
   buildMethodCallStatement(node: CstNode): FunctionCallStatement {
     const children = node.children as CstChildren;
-    const idOrKwNodes = getAllNodes(children.identifierOrKeyword);
-    const instanceName = idOrKwNodes[0]
-      ? getIdentifierOrKeywordImage(idOrKwNodes[0])
-      : "";
-    const methodName = idOrKwNodes[1]
-      ? getIdentifierOrKeywordImage(idOrKwNodes[1])
-      : "";
-
-    const args: Argument[] = [];
-    const argListNode = getFirstNode(children.argumentList);
-    if (argListNode) {
-      const argListChildren = argListNode.children as CstChildren;
-      for (const argNode of getAllNodes(argListChildren.argument)) {
-        args.push(this.buildArgument(argNode));
-      }
-    }
-
-    // Build the base method call
-    let callExpr: FunctionCallExpression | MethodCallExpression = {
-      kind: "FunctionCallExpression",
-      sourceSpan: nodeToSourceSpan(node),
-      functionName: `${instanceName}.${methodName}`,
-      arguments: args,
-    };
+    let callExpr = this.buildMethodCallBase(node);
 
     // Build chained method calls as nested MethodCallExpression nodes
     const chainedCalls = getAllNodes(children.chainedMethodCall);

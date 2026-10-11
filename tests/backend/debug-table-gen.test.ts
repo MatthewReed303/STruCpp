@@ -602,18 +602,18 @@ END_PROGRAM${CFG}`;
     expect(addr).toContain("g_config.INSTANCE0.R.PLAIN");
   });
 
-  it("mangles a member colliding with an implemented interface method", () => {
-    // Codegen renames the variable because the method already owns the name;
-    // addressing `.START` would take the address of the member function instead
-    // ("cannot create a non-constant pointer to member function").
-    const src = `
+  it("never meets a member named like a method or an elementary type: those are refused", () => {
+    // Both used to compile (a method-named member mangled, an elementary-named
+    // one left alone); IEC 61131-3 refuses them before any table is built:
+    // 6.6.5.5.5 rule 2 and 6.1.3 / Table 10.
+    const methodNamed = compile(`
 INTERFACE IMotor
   METHOD Start : BOOL
   END_METHOD
 END_INTERFACE
 FUNCTION_BLOCK Drive IMPLEMENTS IMotor
 VAR Start : BOOL; other : INT; END_VAR
-  METHOD Start : BOOL
+  METHOD PUBLIC Start : BOOL
     Start := TRUE;
   END_METHOD
   other := 1;
@@ -621,49 +621,19 @@ END_FUNCTION_BLOCK
 PROGRAM Main
 VAR d : Drive; END_VAR
   d();
-END_PROGRAM${CFG}`;
-    expect(header(src)).toContain("IEC_BOOL START_;");
-    const addr = addresses(src);
-    expect(addr).toContain("g_config.INSTANCE0.D.START_");
-    expect(addr).not.toMatch(/\.D\.START\b(?!_)/);
-    expect(addr).toContain("g_config.INSTANCE0.D.OTHER");
-  });
-
-  it("does NOT mangle a variable named after an elementary type", () => {
-    // `Time : TIME` is an ordinary declaration — codegen emits it as plain
-    // `TIME`, because the collision rule only applies to user-defined types. A
-    // name-only comparison would mangle it and address a `TIME_` that does not
-    // exist, breaking a build that works today.
-    const src = `
+END_PROGRAM${CFG}`);
+    expect(methodNamed.errors.map((e) => e.message).join("\n")).toMatch(
+      /Variable 'Start' of 'DRIVE' has the name of a method/,
+    );
+    const elementaryNamed = compile(`
+TYPE Bag : STRUCT Time : TIME; END_STRUCT; END_TYPE
 PROGRAM Main
-VAR Time : TIME; Word : WORD; Date : DATE; Real : REAL; END_VAR
-  Time := T#0s;
-END_PROGRAM${CFG}`;
-    expect(header(src)).toContain("IEC_TIME TIME;");
-    const addr = addresses(src);
-    for (const name of ["TIME", "WORD", "DATE", "REAL"]) {
-      expect(addr).toContain(`g_config.INSTANCE0.${name},`);
-    }
-    expect(addr).not.toContain("_,");
-  });
-
-  it("does NOT mangle elementary-named members of an FB or a STRUCT", () => {
-    const src = `
-TYPE Bag : STRUCT Time : TIME; Word : WORD; END_STRUCT; END_TYPE
-FUNCTION_BLOCK Holder
-VAR Time : TIME; b : Bag; END_VAR
-  Time := T#0s;
-END_FUNCTION_BLOCK
-PROGRAM Main
-VAR h : Holder; g : Bag; END_VAR
-  h();
-END_PROGRAM${CFG}`;
-    const addr = addresses(src);
-    expect(addr).toContain("g_config.INSTANCE0.H.TIME,");
-    expect(addr).toContain("g_config.INSTANCE0.H.B.TIME,");
-    expect(addr).toContain("g_config.INSTANCE0.G.WORD,");
-    expect(addr).not.toContain("TIME_");
-    expect(addr).not.toContain("WORD_");
+VAR Word : WORD; g : Bag; END_VAR
+  Word := 1;
+END_PROGRAM${CFG}`);
+    const messages = elementaryNamed.errors.map((e) => e.message).join("\n");
+    expect(messages).toMatch(/'Time' is a keyword/);
+    expect(messages).toMatch(/'Word' is a keyword/);
   });
 
   it("mangles a variable named after an enum type, matching codegen", () => {
@@ -1057,19 +1027,26 @@ END_PROGRAM${CFG_R}`,
     expect(ids[1]![1]).toBe(ids[2]![1]);
     expect(ids.slice(1, 4).map((x) => x[2])).toEqual([1, 2, 3]);
     expect(ids[0]![2]).toBeUndefined();
-    const fnv = (t: string) => {
+    const fnvN = (t: string) => {
       let h = 0x811c9dc5;
       for (const b of Buffer.from(t)) h = Math.imul(h ^ b, 0x01000193) >>> 0;
-      return h.toString(16).padStart(8, "0");
+      return h;
     };
+    const hex = (n: number) => (n >>> 0).toString(16).padStart(8, "0");
+    const fnv = (t: string) => hex(fnvN(t));
     expect(ids[0]![1]).toBe(fnv("INSTANCE0.BOOTS"));
     expect(ids[1]![1]).toBe(fnv("INSTANCE0.SPARE[]"));
-    // An enumeration's definition is part of its identity.
-    expect(ids[5]![1]).toBe(fnv("INSTANCE0.MODE|ENUM MODE_T:(OFF,AUTO)"));
+    // An enumeration's definition is part of its identity: name and base, XOR
+    // its member list (so a shorter start of the list is one XOR away).
+    expect(ids[5]![1]).toBe(hex(fnvN("INSTANCE0.MODE|ENUM MODE_T:") ^ fnvN("(OFF,AUTO)")));
     expect(cpp).toContain("const RetainLeaf retain_leaves[6] STRUCPP_DEBUG_FLASH = {");
-    expect(cpp).toMatch(/\{ 0x[0-9a-f]{8}u, RETAIN_NO_INDEX, TAG_DINT, 0 \},\s*\/\/ INSTANCE0\.BOOTS/);
-    expect(cpp).toMatch(/\{ 0x[0-9a-f]{8}u, 2, TAG_INT, 0 \},\s*\/\/ INSTANCE0\.SPARE\[2\]/);
-    expect(cpp).toMatch(/TAG_STRING, 20 \},\s*\/\/ INSTANCE0\.SITE/);
+    expect(cpp).toMatch(/\{ 0x[0-9a-f]{8}u, RETAIN_NO_INDEX, TAG_DINT, 0, 0 \},\s*\/\/ INSTANCE0\.BOOTS/);
+    expect(cpp).toMatch(/\{ 0x[0-9a-f]{8}u, 2, TAG_INT, 0, 0 \},\s*\/\/ INSTANCE0\.SPARE\[2\]/);
+    expect(cpp).toMatch(/TAG_STRING, 20, 0 \},\s*\/\/ INSTANCE0\.SITE/);
+    // The enumeration's leaf points at its group of shorter-start identities.
+    expect(cpp).toMatch(/TAG_INT, 0, 1 \},\s*\/\/ INSTANCE0\.MODE/);
+    expect(cpp).toContain("const uint8_t retain_alt_group_count = 1;");
+    expect(cpp).toContain(`0x${hex(fnvN("(OFF,AUTO)") ^ fnvN("(OFF)"))}u,`);
     // header 14 + payload (4 + 3*2 + 21 + 2) + trailer 4 + 3 singles*6 + 1 run*12
     expect(map.retainBlobSize).toBe(14 + 33 + 4 + 18 + 12);
   });
@@ -1276,6 +1253,73 @@ END_PROGRAM${CFG_R}`,
   });
 });
 
+describe("a library block's RETAIN inputs and outputs", () => {
+  // IEC 61131-3 6.5.6 admits RETAIN on VAR_INPUT and VAR_OUTPUT. Declared so
+  // inside a library block, the pins are retained in every instance, as a
+  // `VAR RETAIN` member is, however the instance itself was declared.
+  const CFG = `
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK task0(INTERVAL := T#20ms, PRIORITY := 0);
+    PROGRAM instance0 WITH task0 : Main;
+  END_RESOURCE
+END_CONFIGURATION`;
+  const LIB = `
+FUNCTION_BLOCK Setter
+VAR_INPUT RETAIN sp : REAL; END_VAR
+VAR_INPUT go : BOOL; END_VAR
+VAR_OUTPUT RETAIN count : DINT; END_VAR
+VAR_OUTPUT q : BOOL; END_VAR
+  IF go THEN count := count + 1; END_IF;
+  q := sp > 0.0;
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Holder
+VAR_OUTPUT done : BOOL; END_VAR
+VAR inner : Setter; END_VAR
+  inner(go := TRUE);
+  done := inner.q;
+END_FUNCTION_BLOCK
+`;
+  const archive = () => {
+    const built = compileLibrary([{ source: LIB, fileName: "setter.st" }], {
+      name: "retain-pins",
+      version: "1.0.0",
+      namespace: "retainpins",
+    });
+    expect(built.errors).toEqual([]);
+    return built;
+  };
+
+  it("marks the RETAIN pins in the manifest", () => {
+    const setter = archive().manifest.functionBlocks.find((f) => f.name === "SETTER")!;
+    expect(setter.inputs.find((v) => v.name === "SP")?.retain).toBe(true);
+    expect(setter.inputs.find((v) => v.name === "GO")?.retain).toBeUndefined();
+    expect(setter.outputs.find((v) => v.name === "COUNT")?.retain).toBe(true);
+    expect(setter.outputs.find((v) => v.name === "Q")?.retain).toBeUndefined();
+  });
+
+  it("retains them in an instance that is not RETAIN, nested ones included", () => {
+    const built = archive();
+    const r = compile(
+      `PROGRAM Main
+VAR s : Setter; h : Holder; END_VAR
+  s(go := TRUE);
+  h();
+END_PROGRAM${CFG}`,
+      { libraries: [{ manifest: built.manifest, chunks: built.chunks }] as never },
+    );
+    expect(r.errors.map((e) => e.message)).toEqual([]);
+    const retained = (r.debugMap!.retainVars ?? []).map((v) => v.path);
+    expect(retained).toEqual([
+      "INSTANCE0.S.SP",
+      "INSTANCE0.S.COUNT",
+      "INSTANCE0.H.INNER.SP",
+      "INSTANCE0.H.INNER.COUNT",
+    ]);
+  });
+});
+
 describe("debug map raw leaves", () => {
   // The C++ side is checked against the table in
   // tests/integration/debug-bare-array-elements-cpp.test.ts; this pins the
@@ -1320,5 +1364,57 @@ END_CONFIGURATION`);
       if (l.raw === true) expect(l).not.toHaveProperty("readOnly");
       else expect(l).not.toHaveProperty("raw");
     }
+  });
+});
+
+describe("debug-table-gen: ARRAY [*] in-outs, temporaries, edge inputs", () => {
+  const source = `
+FUNCTION_BLOCK Unit
+  VAR_INPUT Go : BOOL R_EDGE; END_VAR
+  VAR_OUTPUT n : INT; END_VAR
+  VAR_TEMP t : INT; END_VAR
+  t := 1;
+  IF Go THEN n := n + t; END_IF;
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK Bank
+  VAR_IN_OUT units : ARRAY[*] OF Unit; levels : ARRAY[*] OF INT; END_VAR
+  VAR_OUTPUT count : INT; END_VAR
+  count := 0;
+END_FUNCTION_BLOCK
+
+PROGRAM main
+  VAR u : ARRAY[1..2] OF Unit; l : ARRAY[1..2] OF INT; b : Bank; END_VAR
+  b(units := u, levels := l);
+END_PROGRAM
+
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK task0(INTERVAL := T#20ms, PRIORITY := 1);
+    PROGRAM instance0 WITH task0 : main;
+  END_RESOURCE
+END_CONFIGURATION
+`;
+
+  it("names an ARRAY [*] in-out as an alias, never an unresolved type", () => {
+    const result = compile(source);
+    expect(result.success).toBe(true);
+    const warnings = result.warnings.map((w) => w.message);
+    expect(warnings.some((m) => m.includes("unresolved type name"))).toBe(false);
+    for (const p of ["INSTANCE0.B.UNITS", "INSTANCE0.B.LEVELS"]) {
+      expect(warnings).toContain(
+        `${p} is not debuggable: ARRAY [*] in-out: a view of the caller's array, an alias debugged at its own name`,
+      );
+    }
+    const paths = result.debugMap!.leaves.map((l) => l.path);
+    expect(paths).toContain("INSTANCE0.U[1].GO");
+  });
+
+  it("lists no temporary and no edge memory", () => {
+    const result = compile(source);
+    const paths = result.debugMap!.leaves.map((l) => l.path);
+    expect(paths.some((p) => p.endsWith(".T"))).toBe(false);
+    expect(paths.some((p) => p.includes("__EDGE"))).toBe(false);
+    expect(paths).toContain("INSTANCE0.U[2].N");
   });
 });

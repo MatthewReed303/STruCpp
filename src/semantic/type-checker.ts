@@ -13,6 +13,7 @@
 import type {
   Expression,
   BinaryExpression,
+  AssignmentAttemptStatement,
   UnaryExpression,
   LiteralExpression,
   VariableExpression,
@@ -56,6 +57,12 @@ import {
   type AccessType,
 } from "./type-utils.js";
 import { stripEnEno } from "../ast-utils.js";
+import {
+  findFunctionBlock,
+  findInterface,
+  implementsInterface,
+  interfacePrototypes,
+} from "./interface-utils.js";
 
 /** A parameter of a called function or FB, as an argument binds to it. */
 interface CallParameter {
@@ -338,15 +345,385 @@ export class TypeChecker {
     while (current && !seen.has(current.toUpperCase())) {
       seen.add(current.toUpperCase());
       const currentName: string = current;
-      const fb = this.ast.functionBlocks.find(
-        (f) => f.name.toUpperCase() === currentName.toUpperCase(),
-      );
-      if (!fb) return undefined;
+      const fb = findFunctionBlock(this.ast, currentName);
+      if (!fb) {
+        // A prototype of an interface or one it EXTENDS (6.6.6.6.1).
+        return interfacePrototypes(this.ast, currentName).find(
+          (p) => p.method.name.toUpperCase() === wanted,
+        )?.method;
+      }
       const method = fb.methods.find((m) => m.name.toUpperCase() === wanted);
       if (method) return method;
       current = fb.extends;
     }
     return undefined;
+  }
+
+  /**
+   * Assignment attempt `target ?= source` (IEC 61131-3 6.6.6.7, Table 52
+   * feature 1): the target is an interface variable; the source an interface
+   * variable, a block instance or NULL. A reference target (feature 2) is not
+   * supported.
+   */
+  private checkAssignmentAttempt(
+    stmt: AssignmentAttemptStatement,
+    scope: Scope,
+  ): void {
+    const targetType = this.resolveExprType(stmt.target, scope);
+    const sourceType = this.resolveExprType(stmt.source, scope);
+    if (this.interfaceOf(targetType) === undefined) {
+      this.addError(
+        `The target of an assignment attempt ?= must be an interface variable (IEC 61131-3 6.6.6.7); ` +
+          `an assignment attempt to a reference is not supported`,
+        stmt.target.sourceSpan.startLine,
+        stmt.target.sourceSpan.startCol,
+        stmt.target.sourceSpan.file,
+      );
+      return;
+    }
+    const source = stmt.source;
+    if (source.kind === "LiteralExpression" && source.literalType === "NULL") {
+      return;
+    }
+    const sourceName = sourceType ? typeNameUtil(sourceType) : undefined;
+    const isInstance =
+      sourceName !== undefined &&
+      this.ast?.functionBlocks.some(
+        (f) => f.name.toUpperCase() === sourceName.toUpperCase(),
+      );
+    if (isInstance === true && this.isSharedGlobal(source, scope)) {
+      this.addError(
+        `A global instance cannot be the source of an assignment attempt ?=: a global is accessed under its own lock, ` +
+          `which a reference would bypass. Use a local instance`,
+        source.sourceSpan.startLine,
+        source.sourceSpan.startCol,
+        source.sourceSpan.file,
+      );
+      return;
+    }
+    if (
+      source.kind === "VariableExpression" &&
+      (this.interfaceOf(sourceType) !== undefined || isInstance === true)
+    ) {
+      return;
+    }
+    this.addError(
+      `The source of an assignment attempt ?= must be an interface variable, a function block instance or NULL (IEC 61131-3 6.6.6.7)`,
+      source.sourceSpan.startLine,
+      source.sourceSpan.startCol,
+      source.sourceSpan.file,
+    );
+  }
+
+  /** The interface a type is, by its declared name; else undefined. */
+  private interfaceOf(type: IECType | undefined): string | undefined {
+    if (!type || !this.ast) return undefined;
+    if (type.typeKind !== "elementary" && type.typeKind !== "functionBlock") {
+      return undefined;
+    }
+    return findInterface(this.ast, typeNameUtil(type))?.name;
+  }
+
+  /**
+   * Assignment to or from an interface variable (IEC 61131-3 6.6.6.5.1): it
+   * takes an instance of a block implementing the interface (or derived from
+   * one), a variable of the same or a derived interface, or NULL. Anything
+   * else into it, and an interface into anything but an interface, is an
+   * error. Returns whether the assignment involved an interface.
+   */
+  private validateInterfaceAssignment(
+    targetType: IECType | undefined,
+    valueType: IECType | undefined,
+    value: Expression,
+    scope?: Scope,
+    receiver?: string,
+  ): boolean {
+    const targetIface = this.interfaceOf(targetType);
+    const valueIface = this.interfaceOf(valueType);
+    if (targetIface === undefined && valueIface === undefined) return false;
+    const isNull =
+      value.kind === "LiteralExpression" && value.literalType === "NULL";
+    if (targetIface !== undefined && isNull) return true;
+    if (
+      targetIface !== undefined &&
+      this.isSharedGlobal(value, scope, receiver)
+    ) {
+      this.addError(
+        `A global instance used by more than one task cannot be assigned to interface ${targetIface}: a global is accessed under its own lock, ` +
+          `which a reference would bypass. Use it from one task only, or pass a local instance`,
+        value.sourceSpan.startLine,
+        value.sourceSpan.startCol,
+        value.sourceSpan.file,
+      );
+      return true;
+    }
+    if (targetIface !== undefined && valueType !== undefined && this.ast) {
+      const valueName = typeNameUtil(valueType);
+      const isBlockOrInterface =
+        valueIface !== undefined ||
+        findFunctionBlock(this.ast, valueName) !== undefined;
+      if (
+        isBlockOrInterface &&
+        implementsInterface(this.ast, valueName, targetIface)
+      ) {
+        return true;
+      }
+      this.addError(
+        `Cannot assign ${valueName} to interface ${targetIface}: it takes an instance of a block implementing it, ` +
+          `a variable of the same or a derived interface, or NULL (IEC 61131-3 6.6.6.5.1)`,
+        value.sourceSpan.startLine,
+        value.sourceSpan.startCol,
+        value.sourceSpan.file,
+      );
+      return true;
+    }
+    if (targetIface === undefined && targetType !== undefined) {
+      this.addError(
+        `Cannot assign interface ${valueIface ?? ""} to ${typeNameUtil(targetType)}: ` +
+          `only an interface variable holds one; use the assignment attempt ?= (IEC 61131-3 6.6.6.7)`,
+        value.sourceSpan.startLine,
+        value.sourceSpan.startCol,
+        value.sourceSpan.file,
+      );
+    }
+    return true;
+  }
+
+  /** Whether `expr` reads a shared global (VAR_EXTERNAL, or a global by name). */
+  private isSharedGlobal(
+    expr: Expression,
+    scope: Scope | undefined,
+    receiver?: string,
+  ): boolean {
+    if (expr.kind !== "VariableExpression" || scope === undefined) return false;
+    const sym = scope.lookup(expr.name);
+    if (!(sym?.kind === "variable" && (sym.isExternal || sym.isGlobal))) {
+      return false;
+    }
+    // A reference to a global instance bypasses that global's lock. That is
+    // only safe when no other thread can reach the instance: every program
+    // that uses it, and the block that receives the reference (when that
+    // block is a global too), run in one and the same task.
+    const tasks = this.tasksUsing(expr.name);
+    if (tasks === "any" || tasks.size > 1) return true;
+    if (receiver !== undefined) {
+      const rsym = scope.lookup(receiver);
+      if (rsym?.kind === "variable" && (rsym.isExternal || rsym.isGlobal)) {
+        const rtasks = this.tasksUsing(receiver);
+        if (rtasks === "any") return true;
+        for (const t of rtasks) if (!tasks.has(t)) return true;
+      }
+    }
+    return false;
+  }
+
+  private globalTaskMap: Map<string, Set<string> | "any"> | undefined;
+
+  /**
+   * The tasks whose programs use a configuration global (by VAR_EXTERNAL),
+   * as "resource.task"; "any" when a function block or function declares it
+   * (it may be called from any task). A program instance without a task is
+   * its own task.
+   */
+  private tasksUsing(name: string): Set<string> | "any" {
+    if (this.globalTaskMap === undefined) {
+      const map = new Map<string, Set<string> | "any">();
+      const add = (n: string, task: string): void => {
+        const key = n.toUpperCase();
+        const cur = map.get(key);
+        if (task === "any" || cur === "any") {
+          map.set(key, "any");
+          return;
+        }
+        const set = cur ?? new Set<string>();
+        set.add(task);
+        map.set(key, set);
+      };
+      const externals = (blocks: ReadonlyArray<VarBlock>): string[] =>
+        blocks
+          .filter((b) => b.blockType === "VAR_EXTERNAL")
+          .flatMap((b) => b.declarations.flatMap((d) => d.names));
+      const ast = this.ast;
+      if (ast) {
+        for (const cfg of ast.configurations) {
+          for (const res of cfg.resources) {
+            for (const pi of res.programInstances) {
+              const prog = ast.programs.find(
+                (p) => p.name.toUpperCase() === pi.programType.toUpperCase(),
+              );
+              if (!prog) continue;
+              const task = `${res.name}.${pi.taskName ?? "#" + pi.instanceName}`;
+              for (const n of externals(prog.varBlocks)) add(n, task);
+            }
+          }
+        }
+        for (const fb of ast.functionBlocks) {
+          for (const n of externals(fb.varBlocks)) add(n, "any");
+        }
+        for (const fn of ast.functions) {
+          for (const n of externals(fn.varBlocks)) add(n, "any");
+        }
+      }
+      this.globalTaskMap = map;
+    }
+    return this.globalTaskMap.get(name.toUpperCase()) ?? new Set<string>();
+  }
+
+  /**
+   * Comparison of interface variables (6.6.6.5.1): `=` and `<>` only, with
+   * a variable of the same interface or NULL.
+   */
+  private validateInterfaceComparison(
+    expr: BinaryExpression,
+    leftType: IECType | undefined,
+    rightType: IECType | undefined,
+  ): void {
+    const left = this.interfaceOf(leftType);
+    const right = this.interfaceOf(rightType);
+    if (left === undefined && right === undefined) return;
+    const isNull = (e: Expression): boolean =>
+      e.kind === "LiteralExpression" && e.literalType === "NULL";
+    const ok =
+      (expr.operator === "=" || expr.operator === "<>") &&
+      ((left !== undefined &&
+        right !== undefined &&
+        left.toUpperCase() === right.toUpperCase()) ||
+        (left !== undefined && isNull(expr.right)) ||
+        (right !== undefined && isNull(expr.left)));
+    if (ok) return;
+    this.addError(
+      `An interface variable compares only for equality (= or <>) with a variable of the same interface or with NULL (IEC 61131-3 6.6.6.5.1)`,
+      expr.sourceSpan.startLine,
+      expr.sourceSpan.startCol,
+      expr.sourceSpan.file,
+    );
+  }
+
+  /**
+   * Arguments passed to an interface-typed input of a block, function or
+   * method follow the assignment rules (6.6.6.5.3: the call passes an
+   * instance to the interface input).
+   */
+  private validateInterfaceArguments(
+    args: ReadonlyArray<{
+      name?: string;
+      isOutput: boolean;
+      value: Expression;
+    }>,
+    inputs: ReadonlyArray<VarBlock> | undefined,
+    scope: Scope,
+    receiver?: string,
+  ): void {
+    if (!inputs || !this.ast) return;
+    const formals: Array<{ name: string; type: string; isArray: boolean }> = [];
+    for (const block of inputs) {
+      if (block.blockType !== "VAR_INPUT") continue;
+      for (const decl of block.declarations) {
+        for (const name of decl.names) {
+          formals.push({
+            name: name.toUpperCase(),
+            type: decl.type.name,
+            isArray: decl.type.arrayDimensions !== undefined,
+          });
+        }
+      }
+    }
+    let position = 0;
+    for (const arg of args) {
+      if (arg.isOutput) continue;
+      const formal =
+        arg.name !== undefined
+          ? formals.find((f) => f.name === arg.name!.toUpperCase())
+          : formals[position++];
+      if (!formal || formal.isArray) continue;
+      const iface = findInterface(this.ast, formal.type);
+      if (!iface) continue;
+      this.validateInterfaceAssignment(
+        {
+          typeKind: "elementary",
+          name: iface.name,
+          sizeBits: 0,
+        } as ElementaryType,
+        arg.value.resolvedType,
+        arg.value,
+        scope,
+        receiver,
+      );
+    }
+  }
+
+  /**
+   * The VAR blocks of what a call invokes: a user function, a block
+   * instance (with the blocks it EXTENDS) or a method `inst.M`.
+   */
+  private calleeInputBlocks(
+    expr: FunctionCallExpression,
+    scope: Scope,
+  ): VarBlock[] | undefined {
+    if (!this.ast) return undefined;
+    const name = expr.functionName;
+    const dot = name.lastIndexOf(".");
+    if (dot > 0) {
+      const objUpper = name.slice(0, dot).toUpperCase();
+      const objSymbol = scope.lookup(name.slice(0, dot));
+      const owner =
+        objUpper === "THIS"
+          ? this.currentFb?.name
+          : objUpper === "SUPER"
+            ? this.currentFb?.extends
+            : objSymbol?.kind === "variable"
+              ? objSymbol.declaration?.type?.name
+              : undefined;
+      return this.findMethodInChain(owner, name.slice(dot + 1))?.varBlocks;
+    }
+    const upper = name.toUpperCase();
+    const fn = this.ast.functions.find((f) => f.name.toUpperCase() === upper);
+    if (fn) return fn.varBlocks;
+    return this.instanceInputBlocks(name, scope);
+  }
+
+  /** The VAR blocks of the block an instance named `name` is, with those it EXTENDS. */
+  private instanceInputBlocks(
+    name: string,
+    scope: Scope,
+  ): VarBlock[] | undefined {
+    if (!this.ast) return undefined;
+    const sym = scope.lookup(name);
+    if (sym?.kind !== "variable") return undefined;
+    const blocks: VarBlock[] = [];
+    const seen = new Set<string>();
+    let current: string | undefined = sym.declaration?.type?.name;
+    while (current !== undefined && !seen.has(current.toUpperCase())) {
+      const upper: string = current.toUpperCase();
+      seen.add(upper);
+      const fb = this.ast.functionBlocks.find(
+        (f) => f.name.toUpperCase() === upper,
+      );
+      if (!fb) break;
+      blocks.push(...fb.varBlocks);
+      current = fb.extends;
+    }
+    if (blocks.length > 0) return blocks;
+    // A library block: its inputs, inherited ones included, from the manifest.
+    const typeName = sym.declaration?.type?.name;
+    const library =
+      typeName !== undefined
+        ? this.symbolTables.lookupFunctionBlock(typeName)
+        : undefined;
+    if (library?.libraryName === undefined || library.inputs.length === 0) {
+      return undefined;
+    }
+    return [
+      {
+        kind: "VarBlock",
+        sourceSpan: library.declaration.sourceSpan,
+        blockType: "VAR_INPUT",
+        isConstant: false,
+        isRetain: false,
+        isNonRetain: false,
+        declarations: library.inputs.map((v) => v.declaration),
+      } as VarBlock,
+    ];
   }
 
   /**
@@ -356,6 +733,9 @@ export class TypeChecker {
     if (!method.returnType) return undefined;
     return (
       ELEMENTARY_TYPES[method.returnType.name.toUpperCase()] ??
+      // A user type (enum, struct): its real type, so the result compares
+      // and assigns as that type does.
+      this.symbolTables.lookupType(method.returnType.name)?.resolvedType ??
       ({
         typeKind: "elementary",
         name: method.returnType.name,
@@ -733,6 +1113,7 @@ export class TypeChecker {
     // when an operand is not (a bare enumeration value, for one). Leaving it
     // untyped let NOT's generic ANY_BIT result through to an IF condition.
     if (["=", "<>", "<", ">", "<=", ">="].includes(expr.operator)) {
+      this.validateInterfaceComparison(expr, resolvedLeft, resolvedRight);
       const bool = ELEMENTARY_TYPES["BOOL"];
       if (bool) expr.resolvedType = bool;
       return bool;
@@ -744,9 +1125,16 @@ export class TypeChecker {
 
     let type: IECType | undefined;
 
-    // AND/OR/XOR are bitwise on ANY_BIT (IEC 61131-3 table 28): BOOL with
+    // AND/OR/XOR are bitwise on ANY_BIT (IEC 61131-3 Table 31): BOOL with
     // BOOL is BOOL, BYTE XOR BYTE is BYTE, and mixed widths take the wider.
     if (["AND", "OR", "XOR"].includes(expr.operator)) {
+      const leftOk = this.checkBitOperand(expr.operator, expr.left, leftType);
+      const rightOk = this.checkBitOperand(
+        expr.operator,
+        expr.right,
+        rightType,
+      );
+      if (!leftOk || !rightOk) return undefined;
       type = getCommonType(leftType, rightType) ?? leftType;
     }
     // IEC 61131-3 date/time arithmetic (table 30 of the standard).
@@ -868,6 +1256,44 @@ export class TypeChecker {
   }
 
   /**
+   * Whether an operand of AND, OR, XOR or NOT is a bit string: IEC 61131-3
+   * Table 31 defines the bitwise Boolean functions (and Table 71 their ST
+   * operators) for ANY_BIT only, so an integer, real or time operand is an
+   * error. An integer literal without a type prefix is a bit-string literal
+   * there (6.3.2, Table 5). Reports the error and returns false.
+   */
+  private checkBitOperand(
+    operator: string,
+    operand: Expression,
+    type: IECType,
+  ): boolean {
+    if (type.typeKind !== "elementary" || isGenericGroupType(type)) {
+      return true;
+    }
+    if (_isTypeInCategory(type, "ANY_BIT")) return true;
+    // `byte + 1`: the untyped literal takes the type of the operand it is
+    // combined with, so the sum is a BYTE (see typeWithLiteralOperands).
+    const withLiterals = this.typeWithLiteralOperands(operand);
+    if (withLiterals && _isTypeInCategory(withLiterals, "ANY_BIT")) {
+      return true;
+    }
+    if (
+      operand.kind === "LiteralExpression" &&
+      operand.typePrefix === undefined &&
+      operand.literalType === "INT"
+    ) {
+      return true;
+    }
+    this.addError(
+      `Operator '${operator}' is defined for ANY_BIT operands only (BOOL, BYTE, WORD, DWORD, LWORD), not for ${typeNameUtil(type)}: IEC 61131-3 Table 31`,
+      operand.sourceSpan.startLine,
+      operand.sourceSpan.startCol,
+      operand.sourceSpan.file,
+    );
+    return false;
+  }
+
+  /**
    * Infer type of a unary expression.
    */
   private inferUnaryType(
@@ -882,6 +1308,9 @@ export class TypeChecker {
 
     let type: IECType | undefined;
     if (expr.operator === "NOT") {
+      if (!this.checkBitOperand("NOT", expr.operand, operandType)) {
+        return undefined;
+      }
       // NOT preserves the operand type for bit types (NOT BYTE returns BYTE)
       type = operandType;
     } else {
@@ -906,6 +1335,12 @@ export class TypeChecker {
     }
     this.validateReferenceArguments(expr, scope);
     this.validateEnumArguments(expr, scope);
+    this.validateInterfaceArguments(
+      expr.arguments,
+      this.calleeInputBlocks(expr, scope),
+      scope,
+      expr.functionName,
+    );
 
     const nameUpper = expr.functionName.toUpperCase();
 
@@ -1021,6 +1456,17 @@ export class TypeChecker {
         if (retType) expr.resolvedType = retType;
         return retType;
       }
+      if (fbTypeName !== undefined && this.ast) {
+        const iface = findInterface(this.ast, fbTypeName);
+        if (iface) {
+          this.addError(
+            `INTERFACE '${iface.name}' has no method '${expr.functionName.slice(dot + 1)}'`,
+            expr.sourceSpan.startLine,
+            expr.sourceSpan.startCol,
+            expr.sourceSpan.file,
+          );
+        }
+      }
       // A deeper access or a namespaced library name is left alone rather than
       // reported as undeclared on a guess.
       return undefined;
@@ -1134,7 +1580,26 @@ export class TypeChecker {
     // The method may be declared on the object's own type or inherited from
     // anything it EXTENDS, so this walks the chain rather than one level.
     const method = this.findMethodInChain(objTypeName, expr.methodName);
+    if (!method) {
+      const iface = findInterface(this.ast, objTypeName);
+      if (iface) {
+        this.addError(
+          `INTERFACE '${iface.name}' has no method '${expr.methodName}'`,
+          expr.sourceSpan.startLine,
+          expr.sourceSpan.startCol,
+          expr.sourceSpan.file,
+        );
+      }
+    }
     if (method) {
+      this.validateInterfaceArguments(
+        expr.arguments,
+        method.varBlocks,
+        scope,
+        expr.object.kind === "VariableExpression"
+          ? expr.object.name
+          : undefined,
+      );
       const retType = this.methodReturnType(method);
       if (retType) {
         expr.resolvedType = retType;
@@ -1179,6 +1644,25 @@ export class TypeChecker {
           );
           continue;
         }
+        // An interface variable starts as NULL, an instance or another
+        // interface variable (Interface_Spec_Init, 6.6.6.5.1).
+        const iface =
+          this.ast && decl.type.arrayDimensions === undefined
+            ? findInterface(this.ast, decl.type.name)
+            : undefined;
+        if (iface) {
+          this.validateInterfaceAssignment(
+            {
+              typeKind: "elementary",
+              name: iface.name,
+              sizeBits: 0,
+            } as ElementaryType,
+            this.resolveExprType(decl.initialValue, scope),
+            decl.initialValue,
+            scope,
+          );
+          continue;
+        }
         const targetType = ELEMENTARY_TYPES[decl.type.name.toUpperCase()];
         if (!targetType) continue; // Non-elementary types — handled elsewhere
         const valueType = this.resolveExprType(decl.initialValue, scope);
@@ -1217,7 +1701,13 @@ export class TypeChecker {
         const targetType = this.resolveExprType(stmt.target, scope);
         const valueType = this.resolveExprType(stmt.value, scope);
         const errorsBefore = this.errors.length;
-        this.validateAssignment(targetType, valueType, stmt.target, stmt.value);
+        this.validateAssignment(
+          targetType,
+          valueType,
+          stmt.target,
+          stmt.value,
+          scope,
+        );
         // One error per mistake: the REF_TO check only adds what the general one missed.
         if (this.errors.length === errorsBefore) {
           this.validateReferenceAssignment(stmt.target, stmt.value, scope);
@@ -1362,6 +1852,10 @@ export class TypeChecker {
         break;
       }
 
+      case "AssignmentAttemptStatement":
+        this.checkAssignmentAttempt(stmt, scope);
+        break;
+
       case "FunctionCallStatement": {
         // resolveExprType already validates function call args
         this.resolveExprType(stmt.call, scope);
@@ -1396,7 +1890,19 @@ export class TypeChecker {
     valueType: IECType | undefined,
     target: Expression,
     value: Expression,
+    scope?: Scope,
   ): void {
+    if (
+      this.validateInterfaceAssignment(
+        targetType,
+        valueType,
+        value,
+        scope,
+        target.kind === "VariableExpression" ? target.name : undefined,
+      )
+    ) {
+      return;
+    }
     if (!targetType || !valueType) return;
 
     // A data type with named values is checked as its base type (IEC 61131-3

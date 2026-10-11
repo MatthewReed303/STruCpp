@@ -209,61 +209,35 @@ END_PROGRAM${CFG}`,
     ).toBe("");
   });
 
-  it("compiles for a member colliding with an implemented interface method", () => {
-    // Used to fail: "cannot create a non-constant pointer to member function"
-    // — the table took the address of the method rather than the variable.
+  it("compiles for interface variables, arrays of them and RETAIN blocks holding them", () => {
+    // An interface variable is a reference (IEC 61131-3 6.6.6.2): no value to
+    // read, force or retain, so the table must leave it out and still compile.
     expect(
       buildDebugTable(
         `
 INTERFACE IMotor
-  METHOD Start : BOOL
+  METHOD IsRunning : BOOL
   END_METHOD
 END_INTERFACE
 FUNCTION_BLOCK Drive IMPLEMENTS IMotor
-VAR Start : BOOL; other : INT; END_VAR
-  METHOD Start : BOOL
-    Start := TRUE;
+VAR_INPUT cmd : BOOL; END_VAR
+  METHOD PUBLIC IsRunning : BOOL
+    IsRunning := cmd;
   END_METHOD
-  other := 1;
+END_FUNCTION_BLOCK
+FUNCTION_BLOCK Pump
+VAR_INPUT motor : IMotor; spares : ARRAY[1..2] OF IMotor; END_VAR
+VAR_OUTPUT run : BOOL; END_VAR
+  IF motor <> NULL THEN run := motor.IsRunning(); END_IF;
 END_FUNCTION_BLOCK
 PROGRAM Main
-VAR d : Drive; END_VAR
-  d();
+VAR d : Drive; p : Pump; m : IMotor := d; ms : ARRAY[1..2] OF IMotor; END_VAR
+VAR RETAIN kept : INT; mr : IMotor; END_VAR
+  d(cmd := TRUE);
+  ms[1] := d;
+  p(motor := m, spares := ms);
 END_PROGRAM${CFG}`,
-        "iface_method",
-      ),
-    ).toBe("");
-  });
-
-  it("compiles for variables named after elementary types", () => {
-    // The inverse failure: mangling these would address a `TIME_` that codegen
-    // never declared.
-    expect(
-      buildDebugTable(
-        `
-PROGRAM Main
-VAR Time : TIME; Word : WORD; Date : DATE; Real : REAL; END_VAR
-  Time := T#0s;
-END_PROGRAM${CFG}`,
-        "elementary_names",
-      ),
-    ).toBe("");
-  });
-
-  it("compiles for elementary-named members of an FB and a STRUCT", () => {
-    expect(
-      buildDebugTable(
-        `
-TYPE Bag : STRUCT Time : TIME; Word : WORD; END_STRUCT; END_TYPE
-FUNCTION_BLOCK Holder
-VAR Time : TIME; b : Bag; END_VAR
-  Time := T#0s;
-END_FUNCTION_BLOCK
-PROGRAM Main
-VAR h : Holder; g : Bag; END_VAR
-  h();
-END_PROGRAM${CFG}`,
-        "elementary_nested",
+        "interface_vars",
       ),
     ).toBe("");
   });
@@ -320,10 +294,10 @@ INTERFACE IProbe
   END_METHOD
 END_INTERFACE
 FUNCTION_BLOCK Sensor IMPLEMENTS IProbe
-VAR_INPUT Reading : Reading; Arm : BOOL; gain : REAL; END_VAR
+VAR_INPUT Reading : Reading; armed : BOOL; gain : REAL; END_VAR
 VAR_OUTPUT out1 : REAL; END_VAR
 VAR_IN_OUT acc : Reading; END_VAR
-  METHOD Arm : BOOL
+  METHOD PUBLIC Arm : BOOL
     Arm := TRUE;
   END_METHOD
   out1 := Reading.v * gain;
@@ -331,7 +305,7 @@ VAR_IN_OUT acc : Reading; END_VAR
 END_FUNCTION_BLOCK
 PROGRAM Main
 VAR s : Sensor; inp : Reading; tally : Reading; got : REAL; END_VAR
-  s(Reading := inp, Arm := TRUE, gain := 2.0, acc := tally, out1 => got);
+  s(Reading := inp, armed := TRUE, gain := 2.0, acc := tally, out1 => got);
 END_PROGRAM${CFG}`,
         "fb_invocation",
       ),

@@ -47,7 +47,7 @@ FUNCTION_BLOCK TrafficLogger
     VAR_INPUT
       fromState : TrafficState;
       toState   : TrafficState;
-      time      : TIME;
+      atTime    : TIME;
     END_VAR
 
     IF NOT initialized THEN
@@ -57,7 +57,7 @@ FUNCTION_BLOCK TrafficLogger
 
     logBuffer[writeIndex].previousState := fromState;
     logBuffer[writeIndex].newState := toState;
-    logBuffer[writeIndex].timestamp := time;
+    logBuffer[writeIndex].timestamp := atTime;
 
     writeIndex := writeIndex + 1;
     IF writeIndex >= bufferSize THEN

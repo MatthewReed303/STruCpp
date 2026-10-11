@@ -44,7 +44,7 @@ import {
   MAX_TYPE_ALIAS_DEPTH,
 } from "../semantic/type-utils.js";
 import { formatArrayElementAccess } from "./codegen-utils.js";
-import { mangledMemberName } from "./member-mangling.js";
+import { fbMethodNamesByBlock, mangledMemberName } from "./member-mangling.js";
 import { GENERATED_TU_MACRO } from "./codegen.js";
 import { walkAST } from "../ast-utils.js";
 
@@ -199,6 +199,46 @@ function fnv1a32(text: string): number {
 const RETAIN_NO_INDEX = -0x80000000;
 
 /**
+ * An enumerated type, for the retained-leaf identity: `head` names the type and
+ * its base (`ENUM MODE_T:USINT`), `members` lists its members in order, each
+ * with its value when one is declared (`A=5`).
+ */
+export interface EnumSig {
+  head: string;
+  members: string[];
+}
+
+/** Hash of an enumeration's first `k` members, in order: `(A,B,...)`. */
+function enumMembersHash(members: string[], k: number): number {
+  return fnv1a32(`(${members.slice(0, k).join(",")})`);
+}
+
+/**
+ * The alternate identities of a retained leaf of an enumerated type, as XOR
+ * deltas from its own identity: one for each shorter START of its member list,
+ * longest first (`n-1` members, then `n-2`, ... 1).
+ *
+ * Decision 26 (pass9 T1): a value stored by a program whose enumeration was the
+ * START of this one — same names, same order, same values, members only
+ * appended — is still a value of this type: every stored member still exists
+ * with the same value (IEC 61131-3 6.4.4.2: a value of an enumerated type is
+ * one of its listed identifiers). So it is kept on an upload, which is a warm
+ * restart (6.5.6.1 rule 1, p.57). Any other change of the enumeration
+ * (reorder, rename, removal, a changed value or base) matches no delta: the
+ * stored value is dropped and the variable starts from its initial value
+ * (6.5.6.2).
+ */
+export function enumPrefixDeltas(sig: EnumSig): number[] {
+  const n = sig.members.length;
+  const full = enumMembersHash(sig.members, n);
+  const out: number[] = [];
+  for (let k = n - 1; k >= 1; k--) {
+    out.push((full ^ enumMembersHash(sig.members, k)) >>> 0);
+  }
+  return out;
+}
+
+/**
  * A retained leaf's identity in a format-2 blob (`retain_leaves[]`).
  *
  * The name of the VARIABLE, because IEC 61131-3 6.5.6.1 rule 1 (p.57) keeps
@@ -206,26 +246,39 @@ const RETAIN_NO_INDEX = -0x80000000;
  * stopped": an upload that adds a member to a RETAIN struct must give every
  * other member its value back, and only a name can say which value is whose.
  * Paths are already canonical — upper case (6.1.2, p.24: identifiers are
- * case-insensitive), dotted, declared subscripts.
+ * case-insensitive), dotted, declared subscripts. An element of an array of
+ * structures or blocks is named by its own subscript (`ZONES[3].SP`), so a
+ * resized array keeps every element whose subscript still exists.
  *
  * An element of an innermost array of scalars hashes the array's path
  * (`CFG.SPARE[]`) and carries its subscript separately, so a resized array
  * keeps its elements by subscript and the blob describes the array as one run.
  *
- * `typeSig` (enumerated and subrange types) is folded into the hash: a changed
- * enumeration is a different variable, never a stored number re-read with a
- * different meaning.
+ * `typeSig` (subrange types) is folded into the hash: a changed subrange is a
+ * different variable, never a stored number re-read with a different meaning.
+ *
+ * An enumerated type (an EnumSig) is folded in as
+ * `FNV(path|ENUM NAME:BASE) XOR FNV((members))`, so the restore can also look
+ * for the identity the same variable had under a shorter START of the member
+ * list (`enumPrefixDeltas`): appending members keeps the value, any other
+ * change of the enumeration drops it.
  */
 export function retainIdentityOf(
   path: string,
-  typeSig?: string,
+  typeSig?: string | EnumSig,
 ): { id: number; index: number } {
-  const sig = typeSig ? `|${typeSig}` : "";
   const m = /^(.*)\[(-?\d+)\]$/.exec(path);
-  if (m) {
-    return { id: fnv1a32(`${m[1]}[]${sig}`), index: Number(m[2]) };
+  const base = m ? `${m[1]}[]` : path;
+  const index = m ? Number(m[2]) : RETAIN_NO_INDEX;
+  if (typeof typeSig === "object") {
+    const id =
+      (fnv1a32(`${base}|${typeSig.head}`) ^
+        enumMembersHash(typeSig.members, typeSig.members.length)) >>>
+      0;
+    return { id, index };
   }
-  return { id: fnv1a32(`${path}${sig}`), index: RETAIN_NO_INDEX };
+  const sig = typeSig ? `|${typeSig}` : "";
+  return { id: fnv1a32(`${base}${sig}`), index };
 }
 
 /** Format-2 payload width of a leaf: natural width, or 1 + declared length. */
@@ -253,7 +306,7 @@ function retainBlobSize2Of(
     tagName: TagName;
     size: number;
     cap: number;
-    typeSig?: string;
+    typeSig?: string | EnumSig;
   }>,
 ): number {
   let payload = 0;
@@ -290,11 +343,10 @@ function retainBlobSize2Of(
 
 /**
  * An enumerated type's definition, for the retained-leaf identity: its name and
- * its members in order with their values. Two enumerations that differ in any
- * of these are different data types, so a stored value of one is not a value
- * of the other (it was a member name, stored as its number).
+ * base, and its members in order with their values. A stored value is kept only
+ * where its enumeration is this one or the START of it (see EnumSig).
  */
-function enumSignature(name: string, def: EnumDefinition): string {
+function enumSignature(name: string, def: EnumDefinition): EnumSig {
   const members = def.members.map((m) => {
     const value = m.value !== undefined ? evalIntConst(m.value) : undefined;
     return value !== undefined
@@ -302,7 +354,7 @@ function enumSignature(name: string, def: EnumDefinition): string {
       : m.name.toUpperCase();
   });
   const base = def.baseType?.name?.toUpperCase() ?? "";
-  return `ENUM ${name.toUpperCase()}:${base}(${members.join(",")})`;
+  return { head: `ENUM ${name.toUpperCase()}:${base}`, members };
 }
 
 /** A subrange type's definition (name, base, bounds), for the same reason. */
@@ -682,7 +734,9 @@ export function generateDebugTable(
   // both predicates have to resolve the same way codegen's do.
 
   const interfaceNames = new Set(
-    ast.interfaces.map((i) => i.name.toUpperCase()),
+    [...ast.interfaces, ...(ast.libraryInterfaces ?? [])].map((i) =>
+      i.name.toUpperCase(),
+    ),
   );
 
   /**
@@ -709,32 +763,11 @@ export function generateDebugTable(
     functionBlockTypeNames.has(name.toUpperCase());
 
   /**
-   * FB type name → upper-cased method names of every interface it implements,
-   * mirroring `CodeGenerator.fbInterfaceMethodNames`. Directly implemented
-   * interfaces only, which is what codegen consults.
+   * FB type name → upper-cased names of its methods (own, inherited and of
+   * every interface it implements), mirroring
+   * `CodeGenerator.fbInterfaceMethodNames` (member-mangling.ts).
    */
-  const fbInterfaceMethods = new Map<string, Set<string>>();
-  {
-    const methodsByInterface = new Map<string, Set<string>>();
-    for (const iface of ast.interfaces) {
-      methodsByInterface.set(
-        iface.name.toUpperCase(),
-        new Set(iface.methods.map((m) => m.name.toUpperCase())),
-      );
-    }
-    for (const fb of ast.functionBlocks) {
-      if (!fb.implements || fb.implements.length === 0) continue;
-      const methods = new Set<string>();
-      for (const ifaceName of fb.implements) {
-        for (const m of methodsByInterface.get(ifaceName.toUpperCase()) ?? []) {
-          methods.add(m);
-        }
-      }
-      if (methods.size > 0) {
-        fbInterfaceMethods.set(fb.name.toUpperCase(), methods);
-      }
-    }
-  }
+  const fbInterfaceMethods = fbMethodNamesByBlock(ast);
 
   // Buckets of entries — grown in order, flushed at program boundary or size cap.
   const arrays: Entry[][] = [[]];
@@ -751,7 +784,7 @@ export function generateDebugTable(
     /** The leaf's Entry, so retain_leaves[] can reuse its cap expression. */
     entry: Entry;
     /** Enumerated / subrange type definition, folded into the identity. */
-    typeSig?: string;
+    typeSig?: string | EnumSig;
   }> = [];
   const skipped: Array<{ path: string; reason: string }> = [];
 
@@ -843,7 +876,7 @@ export function generateDebugTable(
     iecName: string,
     flags: number,
     maxLength?: number | string,
-    typeSig?: string,
+    typeSig?: string | EnumSig,
   ) => {
     if (flags & WALK_RETAINED_ONLY) {
       if (!(flags & LEAF_FLAG_RETAIN)) return;
@@ -1194,11 +1227,14 @@ export function generateDebugTable(
       // `name` is the FB type declaring these members, so it is the owner for
       // both mangling collisions.
       if (fbSym.libraryName !== undefined || interfaceVars.length > 0) {
-        // Walked for nested RETAIN state only: the interface holds none.
+        // Walked for nested RETAIN state only: of the interface, just the
+        // pins the library declared `VAR_INPUT RETAIN` / `VAR_OUTPUT RETAIN`.
         const retainedOnly =
           (flags & WALK_RETAINED_ONLY) !== 0 &&
           (flags & LEAF_FLAG_RETAIN) === 0;
-        for (const v of retainedOnly ? [] : interfaceVars) {
+        for (const v of retainedOnly
+          ? interfaceVars.filter((iv) => iv.isRetain)
+          : interfaceVars) {
           // A function block passed as an in-out is a pointer at someone
           // else's instance (as for a user block below): debugged at its own
           // name, never followed with `.member` through the pointer.
@@ -1212,6 +1248,18 @@ export function generateDebugTable(
               path: `${path}.${v.name.toUpperCase()}`,
               reason:
                 "function block in-out: an alias, debugged at its own name",
+            });
+            continue;
+          }
+          // An `ARRAY [*]` in-out: a view of the caller's array (see below).
+          if (
+            v.isInOut &&
+            v.declaration.type.name.toUpperCase().startsWith("__VLA_")
+          ) {
+            skipped.push({
+              path: `${path}.${v.name.toUpperCase()}`,
+              reason:
+                "ARRAY [*] in-out: a view of the caller's array, an alias debugged at its own name",
             });
             continue;
           }
@@ -1232,7 +1280,14 @@ export function generateDebugTable(
             `${path}.${v.name.toUpperCase()}`,
             `${cppExpr}.${libraryMemberCppName(v, name)}`,
             v.declaration.type,
-            flags,
+            // `VAR_INPUT NON_RETAIN` / `VAR_OUTPUT NON_RETAIN` (6.5.6.2)
+            // opts out of a RETAIN instance; `VAR_INPUT RETAIN` /
+            // `VAR_OUTPUT RETAIN` is retained in every instance (6.5.6).
+            v.isNonRetain === true
+              ? flags & ~LEAF_FLAG_RETAIN
+              : v.isRetain
+                ? flags | LEAF_FLAG_RETAIN
+                : flags,
           );
         }
 
@@ -1252,8 +1307,16 @@ export function generateDebugTable(
         const instanceRetained = (flags & LEAF_FLAG_RETAIN) !== 0;
         // A member that is not RETAIN itself is still walked when RETAIN
         // state is nested in it (a block holding a block), for that state only.
+        // A `VAR NON_RETAIN` member opts out of the instance's RETAIN
+        // (6.5.6.2), as in a user-defined block (applyBlockFlags): walked, like
+        // a member of an unretained instance, only for RETAIN state nested in it.
         const localsToWalk = instanceRetained
-          ? fbSym.locals
+          ? fbSym.locals.filter(
+              (v) =>
+                v.isNonRetain !== true ||
+                v.isRetain ||
+                holdsRetain(v.declaration.type),
+            )
           : fbSym.locals.filter(
               (v) => v.isRetain || holdsRetain(v.declaration.type),
             );
@@ -1280,9 +1343,9 @@ export function generateDebugTable(
               v.declaration.type,
               v.isRetain
                 ? flags | LEAF_FLAG_RETAIN
-                : instanceRetained
+                : instanceRetained && v.isNonRetain !== true
                   ? flags
-                  : flags | WALK_RETAINED_ONLY,
+                  : (flags & ~LEAF_FLAG_RETAIN) | WALK_RETAINED_ONLY,
             );
           }
         }
@@ -1371,6 +1434,22 @@ export function generateDebugTable(
                   }
                   continue;
                 }
+                // An `ARRAY [*]` in-out is a view of the caller's array, whose
+                // length is known only at the call: like a block in-out, an
+                // alias of a variable that is in the table under its own name.
+                if (
+                  block.blockType === "VAR_IN_OUT" &&
+                  fieldDecl.type.name.toUpperCase().startsWith("__VLA_")
+                ) {
+                  for (const fieldName of fieldDecl.names) {
+                    skipped.push({
+                      path: `${path}.${fieldName.toUpperCase()}`,
+                      reason:
+                        "ARRAY [*] in-out: a view of the caller's array, an alias debugged at its own name",
+                    });
+                  }
+                  continue;
+                }
                 const valueInout =
                   block.blockType === "VAR_IN_OUT" &&
                   isValueInoutType(fieldDecl.type);
@@ -1428,9 +1507,10 @@ export function generateDebugTable(
     } else if (def === undefined) {
       const fb = symbolTables.lookupFunctionBlock(name);
       if (fb?.libraryName !== undefined) {
-        result = fb.locals.some(
-          (v) => v.isRetain || holdsRetain(v.declaration.type),
-        );
+        result =
+          fb.locals.some(
+            (v) => v.isRetain || holdsRetain(v.declaration.type),
+          ) || [...fb.inputs, ...fb.outputs].some((v) => v.isRetain);
       } else if (fb) {
         const base = fb.declaration.extends;
         result =
@@ -1713,23 +1793,78 @@ export function generateDebugTable(
   const retainIdentities = retainVars.map((v) =>
     retainIdentityOf(v.path, v.typeSig),
   );
+  // The enumerations of retained leaves, each with its alternate identities
+  // (enumPrefixDeltas): `retainAlt[i]` is leaf i's group, 1-based, 0 for none.
+  // The group number is one byte in retain_leaves[], so past 255 enumerations
+  // a leaf keeps exact matching only, and that is said out loud.
+  const retainAltGroups: Array<{ head: string; deltas: number[] }> = [];
+  const retainAlt: number[] = [];
+  {
+    const groupOf = new Map<string, number>();
+    let overflow: string | undefined;
+    for (const v of retainVars) {
+      const sig = v.typeSig;
+      if (typeof sig !== "object" || sig.members.length < 2) {
+        retainAlt.push(0);
+        continue;
+      }
+      const key = `${sig.head}(${sig.members.join(",")})`;
+      let g = groupOf.get(key);
+      if (g === undefined) {
+        if (retainAltGroups.length >= 255) {
+          overflow ??= v.path;
+          retainAlt.push(0);
+          continue;
+        }
+        retainAltGroups.push({ head: sig.head, deltas: enumPrefixDeltas(sig) });
+        g = retainAltGroups.length;
+        groupOf.set(key, g);
+      }
+      retainAlt.push(g);
+    }
+    if (overflow !== undefined) {
+      incomplete.push({
+        path: overflow,
+        reason:
+          `more than 255 enumerated types are retained: a value of the ones ` +
+          `past the 255th is kept on an upload only while its enumeration is ` +
+          `unchanged, not when members were appended to it.`,
+      });
+    }
+  }
   const retainErrors: Array<{ path: string; reason: string }> = [];
   {
-    const seen = new Map<string, string>();
-    retainVars.forEach((v, i) => {
+    // Every identity a leaf answers to — its own and, for an enumeration, the
+    // ones it had under a shorter start of its member list — names that leaf
+    // alone, or a restored value could reach the wrong variable.
+    const seen = new Map<string, number>();
+    const claim = (key: string, i: number, id: number) => {
+      const owner = seen.get(key);
+      if (owner === undefined) {
+        seen.set(key, i);
+        return;
+      }
+      if (owner === i) return;
+      const v = retainVars[i]!;
+      retainErrors.push({
+        path: v.path,
+        reason:
+          `retained variables '${retainVars[owner]!.path}' and '${v.path}' have the same retain ` +
+          `identity (hash ${id.toString(16).padStart(8, "0")}): a restored value ` +
+          `could reach the wrong one. Rename one of them.`,
+      });
+    };
+    retainVars.forEach((_, i) => {
       const { id, index } = retainIdentities[i]!;
-      const key = `${id}:${index}`;
-      const other = seen.get(key);
-      if (other !== undefined) {
-        retainErrors.push({
-          path: v.path,
-          reason:
-            `retained variables '${other}' and '${v.path}' have the same retain ` +
-            `identity (hash ${id.toString(16).padStart(8, "0")}): a restored value ` +
-            `could reach the wrong one. Rename one of them.`,
-        });
-      } else {
-        seen.set(key, v.path);
+      claim(`${id}:${index}`, i, id);
+    });
+    retainVars.forEach((_, i) => {
+      const g = retainAlt[i]!;
+      if (g === 0) return;
+      const { id, index } = retainIdentities[i]!;
+      for (const d of retainAltGroups[g - 1]!.deltas) {
+        const alt = (id ^ d) >>> 0;
+        claim(`${alt}:${index}`, i, alt);
       }
     });
   }
@@ -1763,6 +1898,8 @@ export function generateDebugTable(
     configName,
     retainVars,
     retainIdentities,
+    retainAlt,
+    retainAltGroups,
     retainLayoutHash,
     globalRuns,
   );
@@ -2030,6 +2167,8 @@ function renderCpp(
     entry: Entry;
   }>,
   retainIdentities: Array<{ id: number; index: number }>,
+  retainAlt: number[],
+  retainAltGroups: Array<{ head: string; deltas: number[] }>,
   retainLayoutHash: string,
   globalRuns: GlobalLeafRun[],
 ): string {
@@ -2237,16 +2376,54 @@ function renderCpp(
   );
   if (retainVars.length === 0) {
     lines.push(
-      "    { 0, RETAIN_NO_INDEX, 0, 0 },  // placeholder — nothing is retained",
+      "    { 0, RETAIN_NO_INDEX, 0, 0, 0 },  // placeholder — nothing is retained",
     );
   } else {
     retainVars.forEach((v, i) => {
       const { id, index } = retainIdentities[i]!;
       const idx = index === RETAIN_NO_INDEX ? "RETAIN_NO_INDEX" : String(index);
       lines.push(
-        `    { 0x${id.toString(16).padStart(8, "0")}u, ${idx}, TAG_${v.tagName}, ${capLiteral(v.entry)} },  // ${v.path}`,
+        `    { 0x${id.toString(16).padStart(8, "0")}u, ${idx}, TAG_${v.tagName}, ${capLiteral(v.entry)}, ${retainAlt[i]!} },  // ${v.path}`,
       );
     });
+  }
+  lines.push("};");
+  lines.push("");
+  // Alternate identities of retained enumerations (decision 26): a value
+  // stored while the enumeration was a START of this one is kept.
+  lines.push(
+    "// Retained enumerations: the identities each one's leaves had while its",
+  );
+  lines.push(
+    "// member list was shorter (members only appended), as XOR deltas.",
+  );
+  let altFirst = 0;
+  const altIds: string[] = [];
+  lines.push(
+    `const RetainAltGroup retain_alt_groups[${retainAltGroups.length || 1}] = {`,
+  );
+  if (retainAltGroups.length === 0) {
+    lines.push("    { 0, 0 },  // placeholder — no retained enumeration");
+  }
+  for (const g of retainAltGroups) {
+    lines.push(
+      `    { ${altFirst}, ${g.deltas.length} },  // ${g.head}, ${g.deltas.length + 1} members`,
+    );
+    altFirst += g.deltas.length;
+    for (const d of g.deltas)
+      altIds.push(`0x${d.toString(16).padStart(8, "0")}u`);
+  }
+  lines.push("};");
+  lines.push(
+    `const uint8_t retain_alt_group_count = ${retainAltGroups.length};`,
+  );
+  lines.push(`const uint32_t retain_alt_ids[${altIds.length || 1}] = {`);
+  if (altIds.length === 0) {
+    lines.push("    0u,  // placeholder");
+  } else {
+    for (let k = 0; k < altIds.length; k += 6) {
+      lines.push(`    ${altIds.slice(k, k + 6).join(", ")},`);
+    }
   }
   lines.push("};");
   lines.push("");

@@ -284,25 +284,47 @@ extern const uint32_t  retain_layout_hash;
 //          array of scalars the hashed path is the ARRAY's ("CFG.SPARE[]") and
 //          the subscript goes in `index`, so a resized array keeps its elements
 //          by subscript and the blob can describe the whole array as one run.
-//          An enumerated or subrange type's definition is folded into the hash
-//          (`path|ENUM ...`): changing the enumeration makes it a different
-//          variable, never a number re-read with another meaning.
+//          A subrange type's definition is folded into the hash
+//          (`path|SUBRANGE ...`): changing it makes it a different variable,
+//          never a number re-read with another meaning. An enumerated type is
+//          folded in as FNV(path|ENUM NAME:BASE) XOR FNV((members)), so the
+//          identity the variable had under a shorter START of its member list
+//          is `id XOR delta` (see `alt`).
 //   index  the declared subscript, or RETAIN_NO_INDEX.
 //   tag    the TypeTag; `cap` the declared STRING/WSTRING length (0 = 254).
+//   alt    0, or 1 + the leaf's enumeration in `retain_alt_groups[]`: a value
+//          stored while that enumeration had only its first members (members
+//          appended since, decision 26) is still a value of it and is kept.
+//          Any other change of the enumeration matches no alternate: dropped.
 //
 // The generator refuses a program in which two retained leaves share
-// (id, index), so one hash can never name two variables of one program.
+// (id, index), so one hash can never name two variables of one program; the
+// alternate identities are included in that check.
 // ---------------------------------------------------------------------------
 struct RetainLeaf {
     uint32_t id;
     int32_t  index;
     uint8_t  tag;
     uint8_t  cap;
+    uint8_t  alt;
 };
 
 constexpr int32_t RETAIN_NO_INDEX = static_cast<int32_t>(0x80000000u);
 
 extern const RetainLeaf retain_leaves[] STRUCPP_DEBUG_FLASH;
+
+// One retained enumeration's alternate identities: retain_alt_ids[first ..
+// first + count), XOR deltas from a leaf's own id, longest shorter start first.
+// Plain `const`, not STRUCPP_DEBUG_FLASH: iec_retain.hpp reads them and has no
+// flash accessors (on AVR they take SRAM: 4 bytes per group plus 4 per member
+// of each retained enumeration; nothing on other targets).
+struct RetainAltGroup {
+    uint16_t first;
+    uint16_t count;
+};
+extern const RetainAltGroup retain_alt_groups[];
+extern const uint8_t        retain_alt_group_count;
+extern const uint32_t       retain_alt_ids[];
 
 /** One retained leaf with everything the retain walk needs, read out of flash
  *  by `handle_retain_leaf()` (debug_dispatch.hpp). */
@@ -313,6 +335,7 @@ struct RetainLeafInfo {
     int32_t  index;
     uint8_t  tag;
     uint8_t  cap;
+    uint8_t  alt;
 };
 
 // Consecutive leaves of one locked global `g`: elements [first, first + count)

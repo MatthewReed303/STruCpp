@@ -62,7 +62,7 @@ describe("declaring a generic type", () => {
 
     const pair = `${iface}
 FUNCTION_BLOCK F IMPLEMENTS ICalc
-METHOD Compute : BOOL VAR_INPUT P : ANY; END_VAR Compute := TRUE; END_METHOD
+METHOD PUBLIC Compute : BOOL VAR_INPUT P : ANY; END_VAR Compute := TRUE; END_METHOD
 ;
 END_FUNCTION_BLOCK
 ${PROG}`;

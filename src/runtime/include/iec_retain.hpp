@@ -371,9 +371,13 @@ inline LoadResult unpack(const uint8_t* blob,
 //   anything else                   refused: the variable keeps its initial
 //                                   value. No narrowing, no REAL -> INT, no
 //                                   STRING <-> WSTRING (Figure 11 NOTE).
-// An enumerated or subrange type's definition is part of the leaf's identity
+// A subrange type's definition is part of the leaf's identity
 // (debug_table.hpp), so changing it gives a new variable, never a number
-// re-read with another meaning.
+// re-read with another meaning. So is an enumerated type's (6.4.4.2) or named-
+// value type's (6.4.4.3), with one exception (decision 26): a value stored
+// while the type's member list was a START of today's — members only appended,
+// same names, order and values — names a member that still exists with the
+// same value, and is kept (`RetainLeaf::alt`). Any other change drops it.
 //
 // SAFETY. Everything is validated — magic, format, lengths, crc, every trailer
 // entry and the payload widths it implies — before the first value is written.
@@ -776,6 +780,24 @@ struct StoredTrailer {
     }
 };
 
+/**
+ * A stored value of leaf `l` saved while its enumeration had only its first
+ * members (members appended since): decision 26. Such a value names a member
+ * this enumeration still has, with the same value (IEC 61131-3 6.4.4.2/3), so an
+ * upload — a warm restart, 6.5.6.1 rule 1 — keeps it. The candidates are the
+ * leaf's own identity XOR each delta of its group (debug_table.hpp); any other
+ * change of the enumeration matches none of them.
+ */
+inline bool find_shorter_enum(StoredTrailer& stored, const debug::RetainLeafInfo& l,
+                              StoredTrailer::Hit* hit) noexcept {
+    if (l.alt == 0 || l.alt > debug::retain_alt_group_count) return false;
+    const debug::RetainAltGroup g = debug::retain_alt_groups[l.alt - 1];
+    for (uint16_t k = 0; k < g.count; ++k) {
+        if (stored.find(l.id ^ debug::retain_alt_ids[g.first + k], l.index, hit)) return true;
+    }
+    return false;
+}
+
 inline LoadResult finish(Report& r, LoadResult result, Report* out) noexcept {
     r.result = static_cast<uint8_t>(result);
     last_report() = r;
@@ -910,13 +932,16 @@ inline LoadResult unpack2(const uint8_t* blob, size_t len, const Host& host,
     bool identical = stored_leaves == debug::retain_var_count;
     uint32_t matched = 0;
     for (uint16_t i = 0; i < debug::retain_var_count; ++i) {
-        debug::RetainLeafInfo l;
+        debug::RetainLeafInfo l = {};
         if (!host.leaf(i, &l)) break;
         detail::StoredTrailer::Hit hit;
         if (!stored.find(l.id, l.index, &hit)) {
-            ++r.added;  // a new variable: its initial value stands (6.5.6.2)
-            identical = false;
-            continue;
+            if (!detail::find_shorter_enum(stored, l, &hit)) {
+                ++r.added;  // a new variable: its initial value stands (6.5.6.2)
+                identical = false;
+                continue;
+            }
+            identical = false;  // its enumeration grew: the layout changed
         }
         ++matched;
         if (hit.ordinal != i || hit.tag != l.tag || hit.cap != l.cap) identical = false;

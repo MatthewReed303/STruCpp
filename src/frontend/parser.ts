@@ -17,6 +17,13 @@ import {
 import * as tokens from "./lexer.js";
 import { resolveErrorMessageProvider } from "./parser-error-message-provider.js";
 
+/** An identifier token spelling `R_EDGE` or `F_EDGE`. */
+function isEdgeQualifier(token: import("chevrotain").IToken): boolean {
+  if (token.tokenType !== tokens.Identifier) return false;
+  const upper = token.image.toUpperCase();
+  return upper === "R_EDGE" || upper === "F_EDGE";
+}
+
 /**
  * STruC++ Parser for IEC 61131-3 Structured Text.
  *
@@ -305,6 +312,10 @@ export class STParser extends CstParser {
         { ALT: () => this.CONSUME(tokens.RETAIN) },
         { ALT: () => this.CONSUME(tokens.NON_RETAIN) },
         { ALT: () => this.CONSUME(tokens.PERSISTENT) },
+        // Access specifier on a VAR section (IEC 61131-3 §6.6.5.10, Var_Decls).
+        { ALT: () => this.CONSUME(tokens.PUBLIC) },
+        { ALT: () => this.CONSUME(tokens.PRIVATE) },
+        { ALT: () => this.CONSUME(tokens.PROTECTED) },
       ]);
     });
     this.MANY(() => {
@@ -426,6 +437,10 @@ export class STParser extends CstParser {
         { ALT: () => this.CONSUME(tokens.RETAIN) },
         { ALT: () => this.CONSUME(tokens.NON_RETAIN) },
         { ALT: () => this.CONSUME(tokens.PERSISTENT) },
+        // Access specifier on a VAR section (IEC 61131-3 §6.6.5.10, Var_Decls).
+        { ALT: () => this.CONSUME(tokens.PUBLIC) },
+        { ALT: () => this.CONSUME(tokens.PRIVATE) },
+        { ALT: () => this.CONSUME(tokens.PROTECTED) },
       ]);
     });
     this.MANY(() => {
@@ -501,6 +516,12 @@ export class STParser extends CstParser {
         },
       },
     ]);
+    // `R_EDGE` / `F_EDGE` after BOOL (IEC 61131-3 Annex A `Edge_Decl`). Read
+    // as an identifier so the words stay usable as names, as OSCAT does.
+    this.OPTION7({
+      GATE: () => isEdgeQualifier(this.LA(1)),
+      DEF: () => this.CONSUME3(tokens.Identifier, { LABEL: "edgeQualifier" }),
+    });
     // Non-standard but widely-used: AT directive after the type.
     this.OPTION3(() => {
       this.CONSUME2(tokens.AT);
@@ -979,14 +1000,17 @@ export class STParser extends CstParser {
           GATE: () => this.isRefAssignAhead(),
         },
         {
+          ALT: () => this.SUBRULE(this.assignAttemptStatement),
+          GATE: () => this.isAssignAttemptAhead(),
+        },
+        {
           ALT: () => this.SUBRULE(this.thisStatement),
           GATE: () => this.LA(1).tokenType === tokens.THIS,
         },
         {
           ALT: () => this.SUBRULE(this.superCallStatement),
           GATE: () =>
-            this.LA(1).tokenType === tokens.SUPER &&
-            this.LA(2).tokenType === tokens.Caret,
+            this.LA(1).tokenType === tokens.SUPER && this.isSuperAhead(),
         },
         // methodCallStatement must come before assignmentStatement/functionCallStatement
         // since all start with Identifier but methodCall needs Ident.Ident( lookahead
@@ -1211,12 +1235,34 @@ export class STParser extends CstParser {
   }
 
   private isMethodCallAhead(): boolean {
-    return (
-      this.isIdentifierOrKeywordToken(this.LA(1).tokenType) &&
-      this.LA(2).tokenType === tokens.Dot &&
-      this.isIdentifierOrKeywordToken(this.LA(3).tokenType) &&
-      this.LA(4)?.tokenType === tokens.LParen
-    );
+    // `inst.M(`, and a method on a longer path: `units[i].M(`, `a.b.M(`.
+    if (!this.isIdentifierOrKeywordToken(this.LA(1).tokenType)) return false;
+    const MAX_LOOKAHEAD = 64;
+    let i = 2;
+    while (i <= MAX_LOOKAHEAD) {
+      const tokenType = this.LA(i)?.tokenType;
+      if (tokenType === tokens.Dot) {
+        if (!this.isIdentifierOrKeywordToken(this.LA(i + 1).tokenType)) {
+          return false;
+        }
+        if (this.LA(i + 2)?.tokenType === tokens.LParen) return true;
+        i += 2;
+      } else if (tokenType === tokens.Caret) {
+        i++;
+      } else if (tokenType === tokens.LBracket) {
+        let depth = 0;
+        for (; i <= MAX_LOOKAHEAD; i++) {
+          const t = this.LA(i)?.tokenType;
+          if (t === undefined || t === tokens.Semicolon) return false;
+          if (t === tokens.LBracket) depth++;
+          else if (t === tokens.RBracket && --depth === 0) break;
+        }
+        i++;
+      } else {
+        return false;
+      }
+    }
+    return false;
   }
 
   /**
@@ -1254,9 +1300,9 @@ export class STParser extends CstParser {
    * instance.method(args); statement
    */
   public methodCallStatement = this.RULE("methodCallStatement", () => {
-    this.SUBRULE(this.identifierOrKeyword); // instance name
+    this.SUBRULE(this.variable); // instance, interface or element path
     this.CONSUME(tokens.Dot);
-    this.SUBRULE2(this.identifierOrKeyword); // method name
+    this.SUBRULE(this.identifierOrKeyword); // method name
     this.CONSUME(tokens.LParen);
     this.OPTION(() => {
       this.SUBRULE(this.argumentList);
@@ -1284,13 +1330,22 @@ export class STParser extends CstParser {
     this.CONSUME(tokens.Semicolon);
   });
 
+  /** `SUPER` followed by `^`, `(` or `.`: a SUPER call or access. */
+  private isSuperAhead(): boolean {
+    const next = this.LA(2).tokenType;
+    return (
+      next === tokens.Caret || next === tokens.LParen || next === tokens.Dot
+    );
+  }
+
   /**
-   * SUPER^(); or SUPER^.method(args); statement
-   * Caret is mandatory — SUPER is a pointer to parent (CODESYS semantics).
+   * SUPER(); / SUPER.method(args); statement (IEC), or with the CODESYS caret.
    */
   public superCallStatement = this.RULE("superCallStatement", () => {
     this.CONSUME(tokens.SUPER);
-    this.CONSUME(tokens.Caret);
+    // IEC 61131-3 §6.6.5.7.3 / §6.6.7.2.9 write `SUPER()` / `SUPER.m()`;
+    // CODESYS writes `SUPER^`. Both are accepted.
+    this.OPTION4(() => this.CONSUME(tokens.Caret));
     this.OR([
       {
         // SUPER^(); — parent body call
@@ -1345,6 +1400,31 @@ export class STParser extends CstParser {
     }
     return false;
   }
+
+  /** Is an assignment attempt `target ?= source;` ahead? */
+  private isAssignAttemptAhead(): boolean {
+    const MAX_LOOKAHEAD = 50;
+    for (let i = 1; i <= MAX_LOOKAHEAD; i++) {
+      const token = this.LA(i);
+      if (token === undefined || token.tokenType === tokens.Semicolon) {
+        return false;
+      }
+      if (token.tokenType === tokens.AssignAttempt) return true;
+      if (token.tokenType === tokens.Assign) return false;
+    }
+    return false;
+  }
+
+  /**
+   * Assignment attempt `target ?= source;`, IEC 61131-3 6.6.6.7.2. Which
+   * targets and sources are allowed is checked by the semantic pass.
+   */
+  public assignAttemptStatement = this.RULE("assignAttemptStatement", () => {
+    this.SUBRULE(this.variable);
+    this.CONSUME(tokens.AssignAttempt);
+    this.SUBRULE(this.expression);
+    this.CONSUME(tokens.Semicolon);
+  });
 
   /**
    * REF= assignment statement (bind REFERENCE_TO to a variable)
@@ -1708,8 +1788,7 @@ export class STParser extends CstParser {
         {
           ALT: () => this.SUBRULE(this.superAccess),
           GATE: () =>
-            this.LA(1).tokenType === tokens.SUPER &&
-            this.LA(2).tokenType === tokens.Caret,
+            this.LA(1).tokenType === tokens.SUPER && this.isSuperAhead(),
         },
         {
           ALT: () => this.SUBRULE(this.methodCall),
@@ -1747,9 +1826,9 @@ export class STParser extends CstParser {
    * instance.method(args) expression
    */
   public methodCall = this.RULE("methodCall", () => {
-    this.SUBRULE(this.identifierOrKeyword); // instance name
+    this.SUBRULE(this.variable); // instance, interface or element path
     this.CONSUME(tokens.Dot);
-    this.SUBRULE2(this.identifierOrKeyword); // method name
+    this.SUBRULE(this.identifierOrKeyword); // method name
     this.CONSUME(tokens.LParen);
     this.OPTION(() => {
       this.SUBRULE(this.argumentList);
@@ -1803,16 +1882,25 @@ export class STParser extends CstParser {
           });
         },
       },
+      {
+        // Bare THIS: the own instance (IEC 61131-3 §6.6.5.7.2), e.g. passed
+        // to an interface input.
+        GATE: () =>
+          this.LA(1).tokenType !== tokens.Caret &&
+          this.LA(1).tokenType !== tokens.Dot,
+        ALT: () => undefined,
+      },
     ]);
   });
 
   /**
-   * SUPER^() or SUPER^.method(args) access
-   * Caret is mandatory — SUPER is a pointer to parent (CODESYS semantics).
+   * SUPER() / SUPER.method(args) access (IEC), or with the CODESYS caret.
    */
   public superAccess = this.RULE("superAccess", () => {
     this.CONSUME(tokens.SUPER);
-    this.CONSUME(tokens.Caret);
+    // IEC 61131-3 §6.6.5.7.3 / §6.6.7.2.9 write `SUPER()` / `SUPER.m()`;
+    // CODESYS writes `SUPER^`. Both are accepted.
+    this.OPTION4(() => this.CONSUME(tokens.Caret));
     this.OR([
       {
         // SUPER^() — parent body call
@@ -1877,39 +1965,48 @@ export class STParser extends CstParser {
    */
   public variable = this.RULE("variable", () => {
     this.SUBRULE(this.identifierOrKeyword);
-    this.MANY(() => {
-      this.OR([
-        {
-          ALT: () => {
-            this.CONSUME(tokens.LBracket);
-            this.AT_LEAST_ONE_SEP({
-              SEP: tokens.Comma,
-              DEF: () => this.SUBRULE(this.expression),
-            });
-            this.CONSUME(tokens.RBracket);
+    // `.name(` ends the path: it is a method called on the variable so far.
+    this.MANY({
+      GATE: () =>
+        !(
+          this.LA(1).tokenType === tokens.Dot &&
+          this.isIdentifierOrKeywordToken(this.LA(2).tokenType) &&
+          this.LA(3).tokenType === tokens.LParen
+        ),
+      DEF: () => {
+        this.OR([
+          {
+            ALT: () => {
+              this.CONSUME(tokens.LBracket);
+              this.AT_LEAST_ONE_SEP({
+                SEP: tokens.Comma,
+                DEF: () => this.SUBRULE(this.expression),
+              });
+              this.CONSUME(tokens.RBracket);
+            },
           },
-        },
-        {
-          ALT: () => {
-            this.CONSUME(tokens.Dot);
-            this.OR3({
-              DEF: [
-                { ALT: () => this.SUBRULE2(this.identifierOrKeyword) },
-                // Bit access: var.0, var.31 — `%X` is optional for bits.
-                { ALT: () => this.CONSUME(tokens.IntegerLiteral) },
-                // Partial access: var.%X15, var.%B3, var.%W1, var.%D0
-                { ALT: () => this.CONSUME(tokens.PartialAccess) },
-              ],
-              IGNORE_AMBIGUITIES: true,
-            });
+          {
+            ALT: () => {
+              this.CONSUME(tokens.Dot);
+              this.OR3({
+                DEF: [
+                  { ALT: () => this.SUBRULE2(this.identifierOrKeyword) },
+                  // Bit access: var.0, var.31 — `%X` is optional for bits.
+                  { ALT: () => this.CONSUME(tokens.IntegerLiteral) },
+                  // Partial access: var.%X15, var.%B3, var.%W1, var.%D0
+                  { ALT: () => this.CONSUME(tokens.PartialAccess) },
+                ],
+                IGNORE_AMBIGUITIES: true,
+              });
+            },
           },
-        },
-        {
-          ALT: () => {
-            this.CONSUME(tokens.Caret);
+          {
+            ALT: () => {
+              this.CONSUME(tokens.Caret);
+            },
           },
-        },
-      ]);
+        ]);
+      },
     });
   });
 

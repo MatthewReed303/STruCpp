@@ -85,8 +85,8 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       // Header: abstract class
-      expect(result.headerCode).toContain("class IMOVABLE {");
-      expect(result.headerCode).toContain("virtual ~IMOVABLE() = default;");
+      expect(result.headerCode).toContain("class IMOVABLE__IFACE : public virtual IEC_IFACE_ROOT {");
+      expect(result.headerCode).toContain("virtual ~IMOVABLE__IFACE() = default;");
       expect(result.headerCode).toContain(
         "virtual void MOVE(IEC_REAL DISTANCE) = 0;",
       );
@@ -102,7 +102,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
         PROGRAM Main END_PROGRAM
       `);
 
-      expect(result.headerCode).toContain("class IREADABLE {");
+      expect(result.headerCode).toContain("class IREADABLE__IFACE : public virtual IEC_IFACE_ROOT {");
       expect(result.headerCode).toContain("virtual IEC_INT READ() = 0;");
     });
 
@@ -119,8 +119,8 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       expect(result.cppCode).not.toContain("ISENSOR::GETVALUE");
     });
 
-    it("should mangle VAR_INPUT names that collide with interface method names", () => {
-      const result = compileAndCheck(`
+    it("refuses a VAR_INPUT named like an interface method (IEC 61131-3 6.6.5.5.5 rule 2)", () => {
+      const result = compile(`
         INTERFACE IControllable
           METHOD Enable : BOOL
           END_METHOD
@@ -143,14 +143,13 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
         PROGRAM Main END_PROGRAM
       `);
 
-      // Variable 'enable' should be mangled to 'ENABLE_' to avoid conflict with ENABLE() method
-      expect(result.headerCode).toContain("IEC_BOOL ENABLE_;");
-      // Non-colliding variable should NOT be mangled
-      expect(result.headerCode).toContain("IEC_INT SPEED;");
-      // Interface method should still be generated
-      expect(result.headerCode).toContain("IEC_BOOL ENABLE()");
-      // Method body should reference the mangled variable name
-      expect(result.cppCode).toContain("ENABLE_");
+      expect(result.success).toBe(false);
+      expect(result.errors.map((e) => e.message).join("\n")).toMatch(
+        /Variable 'enable' of 'MOTOR' has the name of a method/,
+      );
+      expect(result.errors.map((e) => e.message).join("\n")).not.toMatch(
+        /'speed'/,
+      );
     });
   });
 
@@ -213,7 +212,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class ROBOT : public IFIRST, public ISECOND {",
+        "class ROBOT : public virtual IFIRST__IFACE, public virtual ISECOND__IFACE {",
       );
     });
 
@@ -230,7 +229,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class WORKER : public IRUNNABLE {",
+        "class WORKER : public virtual IRUNNABLE__IFACE {",
       );
     });
   });
@@ -255,7 +254,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class SMARTMOTOR : public BASE, public IMOVABLE {",
+        "class SMARTMOTOR : public BASE, public virtual IMOVABLE__IFACE {",
       );
     });
 
@@ -274,7 +273,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       expect(result.headerCode).toContain(
-        "class CHILD : public PARENT, public IA, public IB {",
+        "class CHILD : public PARENT, public virtual IA__IFACE, public virtual IB__IFACE {",
       );
     });
   });
@@ -690,7 +689,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
         PROGRAM Main END_PROGRAM
       `);
 
-      expect(result.headerCode).toContain("virtual ~IDISPOSABLE() = default;");
+      expect(result.headerCode).toContain("virtual ~IDISPOSABLE__IFACE() = default;");
     });
   });
 
@@ -809,7 +808,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
         PROGRAM Main END_PROGRAM
       `);
 
-      expect(result.headerCode).toContain("class IDERIVED : public IBASE {");
+      expect(result.headerCode).toContain("class IDERIVED__IFACE : public virtual IBASE__IFACE {");
     });
 
     it("should generate correct pure virtual methods for derived interface", () => {
@@ -931,7 +930,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       `);
 
       // Interface
-      expect(result.headerCode).toContain("class ICONTROLLABLE {");
+      expect(result.headerCode).toContain("class ICONTROLLABLE__IFACE : public virtual IEC_IFACE_ROOT {");
       expect(result.headerCode).toContain("virtual void START() = 0;");
       expect(result.headerCode).toContain("virtual void STOP() = 0;");
 
@@ -940,7 +939,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
 
       // Derived FB with both extends and implements
       expect(result.headerCode).toContain(
-        "class MOTOR : public DEVICE, public ICONTROLLABLE {",
+        "class MOTOR : public DEVICE, public virtual ICONTROLLABLE__IFACE {",
       );
 
       // Method implementations
@@ -1099,7 +1098,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
           END_PROPERTY
         END_FUNCTION_BLOCK
         FUNCTION_BLOCK Controller
-          VAR motor : Motor; END_VAR
+          VAR PUBLIC motor : Motor; END_VAR
         END_FUNCTION_BLOCK
         PROGRAM Main
           VAR
@@ -1124,7 +1123,7 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
           END_PROPERTY
         END_FUNCTION_BLOCK
         FUNCTION_BLOCK Controller
-          VAR motor : Motor; END_VAR
+          VAR PUBLIC motor : Motor; END_VAR
         END_FUNCTION_BLOCK
         PROGRAM Main
           VAR ctrl : Controller; END_VAR
@@ -1291,5 +1290,67 @@ describe("Codegen - OOP Features (Phase 5.2)", () => {
       // In C++ output: "it's" (the doubled '' becomes a single ')
       expect(result.cppCode).toContain('"it\'s"');
     });
+  });
+});
+
+describe("Codegen - a variable named like a method of its block", () => {
+  it("is refused against inherited interface methods, own and base methods (IEC 61131-3 6.6.5.5.5 rule 2)", () => {
+    const result = compile(`
+      INTERFACE I_A
+        METHOD Good : BOOL END_METHOD
+      END_INTERFACE
+      INTERFACE I_B EXTENDS I_A
+        METHOD Total : LREAL END_METHOD
+      END_INTERFACE
+      FUNCTION_BLOCK F IMPLEMENTS I_B
+        VAR_OUTPUT Good : BOOL; Total : LREAL; Own : INT; END_VAR
+        METHOD PUBLIC Good : BOOL Good := TRUE; END_METHOD
+        METHOD PUBLIC Total : LREAL Total := 1.0; END_METHOD
+        METHOD PUBLIC Own : INT Own := 7; END_METHOD
+        Good := THIS.Good();
+      END_FUNCTION_BLOCK
+      FUNCTION_BLOCK G EXTENDS F
+        VAR_OUTPUT Sum : LREAL; END_VAR
+        SUPER();
+        Sum := Total + 1.0;
+      END_FUNCTION_BLOCK
+      PROGRAM Main END_PROGRAM
+    `);
+    const messages = result.errors.map((e) => e.message).join("\n");
+    for (const name of ["Good", "Total", "Own"]) {
+      expect(messages).toContain(`Variable '${name}' of 'F' has the name of a method`);
+    }
+  });
+});
+
+describe("Codegen - a base block's VAR_IN_OUT in a derived block", () => {
+  // IEC 61131-3 6.6.5.5.2 rule 2: the derived block has all the base's
+  // variables, its in-outs included, so its body goes through the binding and
+  // a call binds the base's in-out as well as the derived block's own.
+  it("dereferences the inherited in-out in the body and binds both at the call", () => {
+    const result = compileAndCheck(`
+      TYPE S : STRUCT x : INT; y : BOOL; END_STRUCT; END_TYPE
+      TYPE S2 : STRUCT z : INT; END_STRUCT; END_TYPE
+      FUNCTION_BLOCK B
+        VAR_IN_OUT Data : S; END_VAR
+        Data.y := Data.x > 0;
+      END_FUNCTION_BLOCK
+      FUNCTION_BLOCK D EXTENDS B
+        VAR_IN_OUT Extra : S2; END_VAR
+        Data.x := Extra.z;
+        SUPER();
+        IF Data.y THEN Extra.z := 0; END_IF;
+      END_FUNCTION_BLOCK
+      PROGRAM Main
+        VAR inst : D; s : S; s2 : S2; END_VAR
+        inst(Data := s, Extra := s2);
+      END_PROGRAM
+    `);
+    const body = result.cppCode.slice(result.cppCode.indexOf("void D::operator()()"));
+    expect(body).toContain("DATA.var().X = EXTRA.var().Z;");
+    expect(body).toContain("DATA.var().Y");
+    expect(result.cppCode).toMatch(/iec_inout_bind\(INST\.DATA,/);
+    expect(result.cppCode).toMatch(/iec_inout_bind\(INST\.EXTRA,/);
+    expect(result.cppCode).not.toMatch(/INST\.DATA = /);
   });
 });

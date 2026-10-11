@@ -760,6 +760,7 @@ inline bool handle_retain_leaf(uint16_t i, RetainLeafInfo* out) noexcept {
     out->index = static_cast<int32_t>(STRUCPP_RETAIN_FLASH_U32(l + offsetof(RetainLeaf, index)));
     out->tag   = STRUCPP_RETAIN_FLASH_U8(l + offsetof(RetainLeaf, tag));
     out->cap   = STRUCPP_RETAIN_FLASH_U8(l + offsetof(RetainLeaf, cap));
+    out->alt   = STRUCPP_RETAIN_FLASH_U8(l + offsetof(RetainLeaf, alt));
 #  undef STRUCPP_RETAIN_FLASH_U8
 #  undef STRUCPP_RETAIN_FLASH_U16
 #  undef STRUCPP_RETAIN_FLASH_U32
@@ -770,6 +771,7 @@ inline bool handle_retain_leaf(uint16_t i, RetainLeafInfo* out) noexcept {
     out->index = retain_leaves[i].index;
     out->tag   = retain_leaves[i].tag;
     out->cap   = retain_leaves[i].cap;
+    out->alt   = retain_leaves[i].alt;
 #endif
     return true;
 }

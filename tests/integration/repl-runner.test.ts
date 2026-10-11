@@ -415,23 +415,23 @@ VAR
   (* an *initialised* colliding member also exercises the constructor
      initializer list, which named the un-mangled member *)
   AiRange : AiRange := (hi := 22.0);
-  Time : TIME;
-  Word : WORD;
+  Tick : TIME;
+  Bits : WORD;
   counter : INT;
 END_VAR
   counter := counter + 1;
   Motor(run := TRUE);
   rig();
-  Word := WORD#7;
+  Bits := WORD#7;
 END_PROGRAM`;
     const output = buildAndRun(
       source,
-      ['run 3', 'get MAIN.COUNTER', 'get MAIN.WORD', 'quit'].join('\n'),
+      ['run 3', 'get MAIN.COUNTER', 'get MAIN.BITS', 'quit'].join('\n'),
       'member_mangling',
     );
-    // Both the mangled composites and the elementary-named scalars are exposed
-    // under the names the user wrote.
+    // The mangled composites and the scalars are exposed under the names the
+    // user wrote (an elementary type name is a keyword, IEC 61131-3 6.1.3).
     expect(output).toContain('MAIN.COUNTER : INT = 3');
-    expect(output).toContain('MAIN.WORD : WORD = 16#0007');
+    expect(output).toContain('MAIN.BITS : WORD = 16#0007');
   });
 });

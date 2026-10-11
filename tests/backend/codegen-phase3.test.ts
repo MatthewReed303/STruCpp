@@ -548,15 +548,15 @@ describe('Phase 3.1 - Expression and Assignment Code Generation', () => {
         FUNCTION_BLOCK Counter
           VAR_INPUT enable : BOOL; END_VAR
           VAR_OUTPUT count : INT; END_VAR
-          VAR internal : INT; END_VAR
-          internal := internal + 1;
-          count := internal;
+          VAR inner : INT; END_VAR
+          inner := inner + 1;
+          count := inner;
         END_FUNCTION_BLOCK
       `;
       const result = compile(source);
       expect(result.success).toBe(true);
-      expect(result.cppCode).toContain('INTERNAL = INTERNAL + 1;');
-      expect(result.cppCode).toContain('COUNT = INTERNAL;');
+      expect(result.cppCode).toContain('INNER = INNER + 1;');
+      expect(result.cppCode).toContain('COUNT = INNER;');
     });
   });
 });

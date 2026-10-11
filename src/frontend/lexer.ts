@@ -605,6 +605,11 @@ export const SignedTypedLiteral = createToken({
 
 export const RefAssign = createToken({ name: "RefAssign", pattern: /REF=/i });
 export const Assign = createToken({ name: "Assign", pattern: /:=/ });
+/** Assignment attempt `?=`, IEC 61131-3 6.6.6.7. */
+export const AssignAttempt = createToken({
+  name: "AssignAttempt",
+  pattern: /\?=/,
+});
 export const OutputAssign = createToken({
   name: "OutputAssign",
   pattern: /=>/,
@@ -818,6 +823,7 @@ export const allTokens = [
   Power,
   RefAssign,
   Assign,
+  AssignAttempt,
   OutputAssign,
   NotEqual,
   LessEqual,

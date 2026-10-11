@@ -107,13 +107,69 @@ export interface LibraryVarType {
   cppName?: string;
   /** The declaring block was `VAR CONSTANT`: read-only in every instance. */
   readOnly?: true;
-  /** The declaring block was `VAR RETAIN`: retained in every instance, whether
-   *  or not the instance itself was declared RETAIN. */
+  /** The declaring block was `VAR RETAIN`, `VAR_INPUT RETAIN` or
+   *  `VAR_OUTPUT RETAIN`: retained in every instance, whether or not the
+   *  instance itself was declared RETAIN. */
   retain?: true;
+  /** The declaring block was `NON_RETAIN` (a VAR, VAR_INPUT or VAR_OUTPUT of a
+   *  block): never retained, even in an instance declared RETAIN — IEC 61131-3
+   *  6.5.6.2. */
+  nonRetain?: true;
   /** Declared length of a `STRING(n)` / `WSTRING(n)`; absent when unqualified. */
   maxLength?: number;
   /** Declared length of an inline array's `STRING(n)` element. */
   elementMaxLength?: number;
+  /**
+   * `R_EDGE` / `F_EDGE` on a BOOL input (IEC 61131-3 6.6.3.2 item 13, Annex A
+   * `Edge_Decl`): the block acts on the input's rising / falling edge. The
+   * edge memory lives inside the block, so a consumer only needs this to
+   * show the pin with its edge marker.
+   */
+  edge?: "R_EDGE" | "F_EDGE";
+}
+
+/**
+ * A method prototype in a manifest (IEC 61131-3 6.6.5.4, 6.6.6.3): the
+ * signature a consumer type-checks a call against and generates it from.
+ *
+ * Library interfaces list every prototype they declare; library function
+ * blocks list their PUBLIC methods (own and inherited, base first, an
+ * OVERRIDE replacing the base's entry), since only those can be called from
+ * outside the block (6.6.5.4.4).
+ */
+export interface LibraryMethodEntry {
+  /** Method name. */
+  name: string;
+  /** Result type; absent for a method that returns nothing. */
+  returnType?: string;
+  /** Declared length of a `STRING(n)` result. */
+  returnMaxLength?: number;
+  /** `VAR_INPUT` parameters, in declaration order. */
+  inputs: LibraryVarType[];
+  /** `VAR_OUTPUT` parameters, in declaration order. */
+  outputs: LibraryVarType[];
+  /** `VAR_IN_OUT` parameters, in declaration order. */
+  inouts: LibraryVarType[];
+  /** An ABSTRACT method: a prototype only (6.6.5.8.2). */
+  isAbstract?: true;
+}
+
+/**
+ * A library INTERFACE (IEC 61131-3 6.6.6): its method prototypes and the
+ * interfaces it EXTENDS (6.6.6.6). The C++ class rides in a `type` chunk of
+ * the same name.
+ */
+export interface LibraryInterfaceEntry {
+  /** Interface name. */
+  name: string;
+  /** Interfaces it EXTENDS, as declared. */
+  extends?: string[];
+  /** Its own method prototypes (not the inherited ones). */
+  methods: LibraryMethodEntry[];
+  /** Help text, as for blocks. */
+  documentation?: string;
+  /** Folder path within the library — see `LibraryFunctionEntry.category`. */
+  category?: string;
 }
 
 /**
@@ -142,6 +198,22 @@ export interface LibraryFBEntry {
    * case-insensitive guess would be wrong on a case-sensitive filesystem.
    */
   sourceFile?: string;
+  /**
+   * The block it EXTENDS (IEC 61131-3 6.6.7.2.8). `inputs`, `outputs`,
+   * `inouts` and `locals` already hold the inherited variables, base first.
+   */
+  extends?: string;
+  /** An ABSTRACT block: a base for others, never instantiated (6.6.5.8.2). */
+  isAbstract?: true;
+  /** A FINAL block: no block may EXTEND it (6.6.5.8.3). */
+  isFinal?: true;
+  /**
+   * The interfaces the block names in IMPLEMENTS (6.6.6.4), as declared.
+   * Those of the blocks it EXTENDS are theirs: a consumer walks `extends`.
+   */
+  implements?: string[];
+  /** Its PUBLIC methods, own and inherited — see {@link LibraryMethodEntry}. */
+  methods?: LibraryMethodEntry[];
   /** Input variables */
   inputs: LibraryVarType[];
   /** Output variables */
@@ -219,6 +291,16 @@ export interface LibraryTypeEntry {
    *  the consumer knows the type is an enum but not what may be written into
    *  one, so every enumerator reads as undeclared. Optional. */
   members?: string[];
+  /** The explicit value of each enumerator, as ST text, parallel to
+   *  `members` (`null` where none was written): `USINT (A := 5, B := 7)`
+   *  keeps 5 and 7, so a consumer evaluates the members as the library does
+   *  (IEC 61131-3 6.4.4.3). Only for `kind: "enum"` with an explicit value.
+   *  Optional: an older archive numbers the members from zero. */
+  values?: Array<string | null>;
+  /** The type's own initial value as ST text (`TYPE E : (A, B) := B`), for
+   *  `kind: "enum"`. A consumer's variables of the type start from it, or
+   *  from the first member when absent (6.4.4.2.2, 6.4.4.3.2). Optional. */
+  defaultValue?: string;
   /** Type-level help text — same lifecycle as `LibraryFBEntry.documentation`,
    *  populated automatically from the structured doc-block slot in CODESYS
    *  imports (typically the type's revision-history comment for OSCAT) and
@@ -273,6 +355,10 @@ export interface LibraryManifest {
   functionBlocks: LibraryFBEntry[];
   /** Exported types */
   types: LibraryTypeEntry[];
+  /** Exported interfaces (IEC 61131-3 6.6.6). Optional: an archive built
+   *  before interfaces were exported has none, and a consumer treats a
+   *  missing field as empty. */
+  interfaces?: LibraryInterfaceEntry[];
   /** Exported global variables (from the library's VAR_GLOBAL blocks).
    *  Optional for backward compatibility with archives compiled before
    *  globals were exported — consumers treat a missing field as empty. */

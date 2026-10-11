@@ -190,3 +190,40 @@ export function translateIECString(inner: string): string {
   }
   return result;
 }
+
+/**
+ * C++ abstract class of an INTERFACE. The interface's own name is the type of
+ * a variable of it — a reference, `IEC_IFACE_REF<NAME__IFACE>` (IEC 61131-3
+ * 6.6.6.2 b). `__` cannot occur in an IEC identifier, so it never collides.
+ */
+export function interfaceClassName(name: string): string {
+  return `${name}__IFACE`;
+}
+
+/**
+ * Interfaces ordered so each follows the ones it EXTENDS (a C++ base must be
+ * complete). Unknown bases and cycles (6.6.6.6.2) are reported by the semantic
+ * pass; here they only keep their source order.
+ */
+export function sortInterfacesByExtends<
+  T extends { name: string; extends?: string[] },
+>(interfaces: readonly T[]): T[] {
+  const byName = new Map(interfaces.map((i) => [i.name.toUpperCase(), i]));
+  const done = new Set<string>();
+  const visiting = new Set<string>();
+  const out: T[] = [];
+  const visit = (iface: T): void => {
+    const key = iface.name.toUpperCase();
+    if (done.has(key) || visiting.has(key)) return;
+    visiting.add(key);
+    for (const base of iface.extends ?? []) {
+      const b = byName.get(base.toUpperCase());
+      if (b) visit(b);
+    }
+    visiting.delete(key);
+    done.add(key);
+    out.push(iface);
+  };
+  for (const iface of interfaces) visit(iface);
+  return out;
+}

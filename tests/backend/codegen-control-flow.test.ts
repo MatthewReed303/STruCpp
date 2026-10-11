@@ -694,10 +694,11 @@ describe("Phase 3.2: Complex Control Flow", () => {
 // =============================================================================
 
 describe("Bitwise AND/OR/XOR Code Generation", () => {
-  it("should generate bitwise & for AND on integer types", () => {
+  it("should generate bitwise & for AND on DWORD types", () => {
+    // AND on an integer type is refused (IEC 61131-3 Table 31: ANY_BIT only).
     const result = compileST(`
       PROGRAM Test
-        VAR a : INT; b : INT; r : INT; END_VAR
+        VAR a : DWORD; b : DWORD; r : DWORD; END_VAR
         r := a AND b;
       END_PROGRAM
     `);

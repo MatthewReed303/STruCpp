@@ -582,6 +582,10 @@ export class ProjectModelBuilder {
             );
           }
         }
+      } else if (block.blockType === "VAR_TEMP") {
+        // Created at each call (IEC 61131-3 6.5.2.1): a local of run(), not a
+        // member of the program instance (codegen emitTemporaries).
+        continue;
       } else {
         for (const decl of block.declarations) {
           for (const varName of decl.names) {

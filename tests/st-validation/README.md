@@ -18,7 +18,7 @@ Self-validation test suite for STruC++. Each category contains source `.st` file
 | data_types       | 12    | Integers, reals, booleans, arrays, structs, subranges, time                                      |
 | composite_access | 2     | Struct member, nested access                                                                     |
 | functions        | 3     | Basic functions, function calls, std functions                                                   |
-| function_blocks  | 15    | Basic FB, state, composition, methods, inheritance, interfaces, OOP extensions                   |
+| function_blocks  | 19    | Basic FB, state, composition, methods, inheritance, SUPER(), interfaces, edge inputs, VAR_TEMP   |
 | standard_fbs     | 4     | TON/TOF/TP timers, CTU/CTD/CTUD counters, R_TRIG/F_TRIG, SR/RS bistables                         |
 | oscat            | 10    | OSCAT basic library: math, trig, hyperbolic, bits, logic, string, convert, encoding, control, FB |
 | programs         | 2     | Multi-program, configuration                                                                     |

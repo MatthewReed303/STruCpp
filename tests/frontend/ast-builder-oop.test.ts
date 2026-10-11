@@ -43,7 +43,7 @@ describe("AST Builder - OOP Features", () => {
       const method = fb.methods[0]!;
       expect(method.kind).toBe("MethodDeclaration");
       expect(method.name).toBe("START");
-      expect(method.visibility).toBe("PUBLIC");
+      expect(method.visibility).toBe("PROTECTED"); // IEC 61131-3 6.6.5.9: the default
       expect(method.isAbstract).toBe(false);
       expect(method.isFinal).toBe(false);
       expect(method.isOverride).toBe(false);

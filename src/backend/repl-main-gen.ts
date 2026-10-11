@@ -11,6 +11,8 @@
 import type { CompilationUnit, VarBlock } from "../frontend/ast.js";
 import type { ProjectModel } from "../project-model.js";
 import type { LineMapEntry } from "../types.js";
+import type { SymbolTables } from "../semantic/symbol-table.js";
+import { isElementaryType } from "../semantic/type-registry.js";
 import { getProjectNamespace } from "../project-model.js";
 import { mangledMemberName, userDefinedTypeNames } from "./member-mangling.js";
 import { GENERATED_TU_MACRO } from "./codegen.js";
@@ -105,6 +107,12 @@ export interface ReplMainGenOptions {
   lineMap?: Map<number, LineMapEntry>;
   /** Line mapping from ST to C++ header for side-by-side alignment */
   headerLineMap?: Map<number, LineMapEntry>;
+  /**
+   * The compilation's symbol tables (`CompileResult.symbolTables`), so a
+   * variable named like a LIBRARY type (`ton : TON`) is addressed under the
+   * C++ name codegen gave it. Without them only the unit's own types count.
+   */
+  symbolTables?: SymbolTables;
 }
 
 /**
@@ -216,9 +224,9 @@ export function generateReplMain(
   const hasConfigurations = projectModel.configurations.length > 0;
 
   if (hasConfigurations) {
-    generateWithConfiguration(lines, ast, projectModel);
+    generateWithConfiguration(lines, ast, projectModel, options.symbolTables);
   } else {
-    generateStandalone(lines, ast, projectModel);
+    generateStandalone(lines, ast, projectModel, options.symbolTables);
   }
 
   return lines.join("\n");
@@ -247,13 +255,23 @@ function emitVarDescriptors(
   lines: string[],
   programs: ProgramInfo[],
   ast: CompilationUnit,
+  symbolTables?: SymbolTables,
 ): void {
   // Program variables only, and a PROGRAM implements no interfaces, so the
-  // name-matches-its-own-type collision is the only one that can apply.
+  // name-matches-its-own-type collision is the only one that can apply. The
+  // type may be a library's (`ton : TON`), which codegen mangles as well, so
+  // the symbol tables count as `CodeGenerator.isUserDefinedType` does.
   const userTypes = userDefinedTypeNames(ast);
   const ctx = {
-    isUserDefinedType: (typeName: string): boolean =>
-      userTypes.has(typeName.toUpperCase()),
+    isUserDefinedType: (typeName: string): boolean => {
+      const upper = typeName.toUpperCase();
+      if (userTypes.has(upper)) return true;
+      if (!symbolTables || isElementaryType(upper)) return false;
+      return (
+        symbolTables.lookupFunctionBlock(upper) !== undefined ||
+        symbolTables.lookupType(upper) !== undefined
+      );
+    },
   };
   for (const prog of programs) {
     if (prog.vars.length > 0) {
@@ -324,6 +342,7 @@ function generateStandalone(
   lines: string[],
   ast: CompilationUnit,
   _projectModel: ProjectModel,
+  symbolTables?: SymbolTables,
 ): void {
   const programs: ProgramInfo[] = ast.programs.map((prog) => {
     const instanceVar = `prog_${prog.name}`;
@@ -342,7 +361,7 @@ function generateStandalone(
   }
   lines.push("");
 
-  emitVarDescriptors(lines, programs, ast);
+  emitVarDescriptors(lines, programs, ast, symbolTables);
   emitProgramDescriptorsAndMain(lines, programs);
 }
 
@@ -354,6 +373,7 @@ function generateWithConfiguration(
   lines: string[],
   ast: CompilationUnit,
   projectModel: ProjectModel,
+  symbolTables?: SymbolTables,
 ): void {
   const config = projectModel.configurations[0];
   if (!config) return;
@@ -384,6 +404,6 @@ function generateWithConfiguration(
     }
   }
 
-  emitVarDescriptors(lines, programs, ast);
+  emitVarDescriptors(lines, programs, ast, symbolTables);
   emitProgramDescriptorsAndMain(lines, programs);
 }

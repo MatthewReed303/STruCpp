@@ -33,7 +33,6 @@ import type {
   Statement,
   TestFile,
   TestStatement,
-  Visibility,
 } from "../frontend/ast.js";
 import type { CompileError, SourceSpan } from "../types.js";
 import { describeInlineType } from "../frontend/lower-inline-types.js";
@@ -45,6 +44,10 @@ import type {
   VariableSymbol,
 } from "./symbol-table.js";
 import { TypeChecker } from "./type-checker.js";
+import {
+  interfaceExtendsItself,
+  interfacePrototypes,
+} from "./interface-utils.js";
 import {
   arrayDimSize,
   arrayElementTypeName,
@@ -89,6 +92,8 @@ import {
   stdParamNameAt,
   type StdSignature,
 } from "./std-function-registry.js";
+import { checkFunctionBlockRules } from "./fb-rules.js";
+import { checkDeclarationNames } from "./declaration-names.js";
 
 // =============================================================================
 // Located Variable Address Parsing
@@ -524,6 +529,32 @@ export class SemanticAnalyzer {
    * Build symbol tables from the AST.
    */
   private buildSymbolTables(ast: CompilationUnit): void {
+    // One name, one data type: a second TYPE of a name already declared in
+    // this compilation (another file included) is an error, never a silent
+    // replacement of the first. IEC 61131-3 6.4.4.1.1 (a type declaration
+    // gives the type its name) and 6.9.1 (one name, one language element per
+    // namespace; this compilation is the global namespace). A hoisted inline
+    // type carries a generated name and is not checked here.
+    const firstType = new Map<string, TypeDeclaration>();
+    for (const typeDecl of ast.types) {
+      if (typeDecl.inline !== undefined) continue;
+      const key = typeDecl.name.toUpperCase();
+      const first = firstType.get(key);
+      if (first === undefined) {
+        firstType.set(key, typeDecl);
+        continue;
+      }
+      const where = first.sourceSpan.file
+        ? `${first.sourceSpan.file}:${first.sourceSpan.startLine}`
+        : `line ${first.sourceSpan.startLine}`;
+      this.addError(
+        `Data type '${typeDecl.name}' is already declared (${where}): one name, ` +
+          `one declaration (IEC 61131-3 6.4.4.1.1, 6.9.1)`,
+        typeDecl.sourceSpan.startLine,
+        typeDecl.sourceSpan.startCol,
+        typeDecl.sourceSpan.file,
+      );
+    }
     // Register type declarations
     for (const typeDecl of ast.types) {
       try {
@@ -992,6 +1023,16 @@ export class SemanticAnalyzer {
     // Validate OOP property/member name collisions
     this.validatePropertyNameCollisions(ast);
 
+    // Keywords as names, case-insensitive duplicates, a variable named like a
+    // method of its block (IEC 61131-3 6.1.2, 6.1.3, 6.6.5.5.5)
+    for (const e of checkDeclarationNames(ast)) {
+      const { startLine, startCol, file } = e.span;
+      this.addError(e.message, startLine, startCol, file);
+    }
+
+    // Validate interface declarations and their use (IEC 61131-3 6.6.6)
+    this.validateInterfaceRules(ast);
+
     // Validate OOP modifier contradictions
     this.validateOOPModifiers(ast);
 
@@ -1001,8 +1042,15 @@ export class SemanticAnalyzer {
     // Validate property write access (read-only check)
     this.validatePropertyAccess(ast);
 
-    // Validate access modifier enforcement
-    this.validateAccessModifiers(ast);
+    // Function block rules: inheritance, access specifiers, edge inputs and
+    // temporaries (IEC 61131-3 6.5.2.1, 6.6.3.2, 6.6.5.5-6.6.5.10, 6.6.7.2)
+    const isFbType = (name: string): boolean =>
+      this.symbolTables.lookupFunctionBlock(name) !== undefined;
+    for (const e of checkFunctionBlockRules(ast, isFbType)) {
+      const { startLine, startCol, file } = e.span;
+      if (e.warning) this.addWarning(e.message, startLine, startCol, file);
+      else this.addError(e.message, startLine, startCol, file);
+    }
 
     // Validate bit access bounds and ADR l-value targets
     this.validateExpressions(ast);
@@ -1012,6 +1060,9 @@ export class SemanticAnalyzer {
 
     // Validate that structure initializers only appear where IEC allows them
     this.validateStructInitializerPlacement(ast);
+
+    // Validate that every element a structure initializer names exists
+    this.validateStructInitializerMembers(ast);
 
     // Validate that integer literals fit an IEC integer type
     this.validateIntegerLiteralRange(ast);
@@ -1364,6 +1415,111 @@ export class SemanticAnalyzer {
       );
       // One diagnostic per initializer, not one per nesting level.
       return false;
+    });
+  }
+
+  /**
+   * Reject a structure initializer element the structure does not have.
+   *
+   * IEC 61131-3 6.4.4.6.2 (and Annex B.1.4.3 `structure_element_initialization`):
+   * each element of a structure initializer names an element of the
+   * structured type. `d : RATE_DATA := (unit := ...)` where `unit` is a member
+   * of the nested `set` names nothing; reported here against the source rather
+   * than left for the C++ compiler to call "has no member". Followed through
+   * nested initializers, array literals and type aliases; a type whose elements
+   * are not known here (a function block's initial inputs, an opaque library
+   * type) is not checked.
+   */
+  private validateStructInitializerMembers(ast: CompilationUnit): void {
+    type Shape =
+      | { kind: "struct"; name: string; fields: Map<string, TypeReference> }
+      | { kind: "array"; element: TypeReference }
+      | undefined;
+    const shapeOf = (ref: TypeReference, depth = 0): Shape => {
+      if (depth > 16) return undefined;
+      if (ref.referenceKind !== undefined && ref.referenceKind !== "none") {
+        return undefined;
+      }
+      if (ref.arrayDimensions && ref.elementTypeName) {
+        return {
+          kind: "array",
+          element: {
+            kind: "TypeReference",
+            sourceSpan: ref.sourceSpan,
+            name: ref.elementTypeName,
+            isReference: false,
+            referenceKind: "none",
+          } as TypeReference,
+        };
+      }
+      const def = this.symbolTables.lookupType(ref.name)?.declaration
+        ?.definition;
+      if (!def) return undefined;
+      if (def.kind === "StructDefinition") {
+        const fields = new Map<string, TypeReference>();
+        for (const f of def.fields) {
+          for (const n of f.names) fields.set(n.toUpperCase(), f.type);
+        }
+        return { kind: "struct", name: ref.name, fields };
+      }
+      if (def.kind === "ArrayDefinition") {
+        return { kind: "array", element: def.elementType };
+      }
+      if (
+        def.kind === "TypeReference" &&
+        def.name.toUpperCase() !== ref.name.toUpperCase()
+      ) {
+        return shapeOf(def, depth + 1);
+      }
+      return undefined;
+    };
+    const check = (init: Expression, ref: TypeReference, depth = 0): void => {
+      if (depth > 16) return;
+      if (init.kind === "ArrayLiteralExpression") {
+        const shape = shapeOf(ref);
+        if (shape?.kind !== "array") return;
+        for (const e of init.elements) {
+          check(e, shape.element, depth + 1);
+        }
+        return;
+      }
+      if (init.kind !== "StructInitializerExpression") return;
+      const shape = shapeOf(ref);
+      if (shape?.kind !== "struct") return;
+      for (const el of init.elements) {
+        const field = shape.fields.get(el.name.toUpperCase());
+        if (field === undefined) {
+          const span = el.sourceSpan;
+          this.addError(
+            `Structure '${shape.name}' has no element '${el.name}' ` +
+              `(its elements: ${[...shape.fields.keys()].join(", ")}). ` +
+              `A nested element is initialized inside its own structure: ` +
+              `(outer := (inner := value)). IEC 61131-3 6.4.4.6.2`,
+            span.startLine,
+            span.startCol,
+            span.file,
+          );
+          continue;
+        }
+        check(el.value, field, depth + 1);
+      }
+    };
+    walkAST(ast, (node) => {
+      if (node.kind === "VarDeclaration") {
+        const decl = node as VarDeclaration;
+        if (decl.initialValue) check(decl.initialValue, decl.type);
+      } else if (node.kind === "TypeDeclaration") {
+        const type = node as TypeDeclaration;
+        if (type.defaultValue) {
+          check(type.defaultValue, {
+            kind: "TypeReference",
+            sourceSpan: type.sourceSpan,
+            name: type.name,
+            isReference: false,
+            referenceKind: "none",
+          } as TypeReference);
+        }
+      }
     });
   }
 
@@ -1974,6 +2130,9 @@ export class SemanticAnalyzer {
     let block: FunctionBlockSymbol | undefined = fb;
     while (block && !lineage.includes(block)) {
       lineage.push(block);
+      // A library block already lists what it inherits — its pins and its
+      // public methods, base first — so its bases add nothing but repeats.
+      if (block.libraryName !== undefined) break;
       const parent: string | undefined = block.declaration.extends;
       block =
         parent !== undefined && parent !== ""
@@ -2346,6 +2505,21 @@ export class SemanticAnalyzer {
       return;
     }
     const actual = sym.declaration.type.name.toUpperCase();
+    if (actual !== target.type) {
+      const wanted = this.symbolTables.lookupFunctionBlock(target.type);
+      const given = this.symbolTables.lookupFunctionBlock(actual);
+      if (wanted && given) {
+        this.checkDerivedInOutActual(
+          callee,
+          slotName,
+          value.name,
+          given,
+          wanted,
+          span,
+        );
+        return;
+      }
+    }
     if (
       actual === target.type ||
       ELEMENTARY_TYPES[actual] === undefined ||
@@ -2359,6 +2533,59 @@ export class SemanticAnalyzer {
       span.startCol,
       span.file,
     );
+  }
+
+  /**
+   * A function block in-out takes an instance of its type or of a type derived
+   * from it, when the derived type adds no in-out (IEC 61131-3 6.6.8.3).
+   */
+  private checkDerivedInOutActual(
+    callee: string,
+    slotName: string,
+    argName: string,
+    given: FunctionBlockSymbol,
+    wanted: FunctionBlockSymbol,
+    span: SourceSpan,
+  ): void {
+    if (!this.derivesFrom(given, wanted)) {
+      this.addError(
+        `'${argName}' is ${given.name}, which is not ${wanted.name} or derived from it, and cannot be assigned to in-out '${slotName}' of '${callee}' (IEC 61131-3 6.6.8.3)`,
+        span.startLine,
+        span.startCol,
+        span.file,
+      );
+      return;
+    }
+    const inouts = (fb: FunctionBlockSymbol): number =>
+      this.fbSlots(fb).filter((s) => s.kind === "inout").length;
+    if (inouts(given) > inouts(wanted)) {
+      this.addError(
+        `'${argName}' is ${given.name}, which has an additional in-out over ${wanted.name}, and cannot be assigned to in-out '${slotName}' of '${callee}' (IEC 61131-3 6.6.8.3)`,
+        span.startLine,
+        span.startCol,
+        span.file,
+      );
+    }
+  }
+
+  /** Whether `fb` is `base` or EXTENDS it, through library blocks too. */
+  private derivesFrom(
+    fb: FunctionBlockSymbol,
+    base: FunctionBlockSymbol,
+  ): boolean {
+    const seen = new Set<FunctionBlockSymbol>();
+    let current: FunctionBlockSymbol | undefined = fb;
+    while (current && !seen.has(current)) {
+      if (current === base) return true;
+      seen.add(current);
+      const parent: string | undefined =
+        current.declaration.extends ?? current.libraryExtends;
+      current =
+        parent !== undefined && parent !== ""
+          ? this.symbolTables.lookupFunctionBlock(parent)
+          : undefined;
+    }
+    return false;
   }
 
   /** An in-out belongs to the block's own body and to the call, nowhere else. */
@@ -2844,12 +3071,13 @@ export class SemanticAnalyzer {
       fbMap.set(fb.name.toUpperCase(), fb);
     }
 
-    // Build interface lookup map
+    // Build interface lookup map: each interface's own prototypes and those
+    // it inherits through EXTENDS (6.6.6.6.1 rules 1 and 4).
     const ifaceMap = new Map<string, Set<string>>();
     for (const iface of ast.interfaces) {
       const methodNames = new Set<string>();
-      for (const m of iface.methods) {
-        methodNames.add(m.name.toUpperCase());
+      for (const m of interfacePrototypes(ast, iface.name)) {
+        methodNames.add(m.method.name.toUpperCase());
       }
       ifaceMap.set(iface.name.toUpperCase(), methodNames);
     }
@@ -2974,6 +3202,197 @@ export class SemanticAnalyzer {
   }
 
   /**
+   * IEC 61131-3 6.6.6 rules for interfaces:
+   * - EXTENDS names interfaces only, without recursion, and adds no prototype
+   *   a base already has (6.6.6.6.2).
+   * - IMPLEMENTS names interfaces only; each implementing method matches its
+   *   prototype and is PUBLIC or INTERNAL (6.6.6.4.2 items 2 and 3).
+   * - An interface is not an in-out variable (6.6.6.2 b).
+   */
+  private validateInterfaceRules(ast: CompilationUnit): void {
+    // The unit's own interfaces and those of the libraries it is compiled
+    // against: a block may IMPLEMENT or EXTEND a library interface (6.6.6).
+    const ifaces = new Map(
+      [...(ast.libraryInterfaces ?? []), ...ast.interfaces].map((i) => [
+        i.name.toUpperCase(),
+        i,
+      ]),
+    );
+
+    for (const iface of ast.interfaces) {
+      const at = iface.sourceSpan;
+      for (const base of iface.extends ?? []) {
+        if (!ifaces.has(base.toUpperCase()) && this.isKnownType(base)) {
+          this.addError(
+            `INTERFACE '${iface.name}' can only EXTEND interfaces; '${base}' is not an interface (IEC 61131-3 6.6.6.6)`,
+            at.startLine,
+            at.startCol,
+            at.file,
+          );
+        }
+      }
+      if (interfaceExtendsItself(ast, iface.name)) {
+        this.addError(
+          `INTERFACE '${iface.name}' is its own base interface; recursion is not permitted (IEC 61131-3 6.6.6.6.2)`,
+          at.startLine,
+          at.startCol,
+          at.file,
+        );
+        continue;
+      }
+      // 6.6.6.3: a prototype holds inputs, outputs, in-outs and a result only.
+      for (const m of iface.methods) {
+        for (const block of m.varBlocks) {
+          if (
+            block.blockType === "VAR_INPUT" ||
+            block.blockType === "VAR_OUTPUT" ||
+            block.blockType === "VAR_IN_OUT"
+          ) {
+            continue;
+          }
+          this.addError(
+            `Method prototype '${m.name}' of INTERFACE '${iface.name}' cannot declare ${block.blockType}: ` +
+              `a prototype has only VAR_INPUT, VAR_OUTPUT and VAR_IN_OUT (IEC 61131-3 6.6.6.3)`,
+            block.sourceSpan.startLine,
+            block.sourceSpan.startCol,
+            block.sourceSpan.file,
+          );
+        }
+      }
+      const inherited = new Map<string, string>();
+      for (const base of iface.extends ?? []) {
+        for (const p of interfacePrototypes(ast, base)) {
+          inherited.set(p.method.name.toUpperCase(), p.owner);
+        }
+      }
+      for (const m of iface.methods) {
+        const owner = inherited.get(m.name.toUpperCase());
+        if (owner !== undefined) {
+          this.addError(
+            `INTERFACE '${iface.name}' declares method '${m.name}', already a prototype of its base interface '${owner}' (IEC 61131-3 6.6.6.6.2)`,
+            m.sourceSpan.startLine,
+            m.sourceSpan.startCol,
+            m.sourceSpan.file,
+          );
+        }
+      }
+    }
+
+    const fbMap = new Map(
+      ast.functionBlocks.map((f) => [f.name.toUpperCase(), f]),
+    );
+    for (const fb of ast.functionBlocks) {
+      for (const name of fb.implements ?? []) {
+        if (!ifaces.has(name.toUpperCase())) {
+          if (this.isKnownType(name)) {
+            this.addError(
+              `FUNCTION_BLOCK '${fb.name}' can only IMPLEMENT interfaces; '${name}' is not an interface (IEC 61131-3 6.6.6.4)`,
+              fb.sourceSpan.startLine,
+              fb.sourceSpan.startCol,
+              fb.sourceSpan.file,
+            );
+          }
+          continue;
+        }
+        const parentMethods = this.collectParentMethods(fb, fbMap);
+        for (const proto of interfacePrototypes(ast, name)) {
+          const key = proto.method.name.toUpperCase();
+          const impl =
+            fb.methods.find((m) => m.name.toUpperCase() === key) ??
+            parentMethods.get(key);
+          if (!impl) continue; // a missing method is reported with IMPLEMENTS
+          if (methodSignature(impl) !== methodSignature(proto.method)) {
+            this.addError(
+              `Method '${impl.name}' of '${fb.name}' does not match its prototype in INTERFACE '${proto.owner}': ` +
+                `expected ${methodSignature(proto.method)}, got ${methodSignature(impl)} (IEC 61131-3 6.6.6.4.2)`,
+              impl.sourceSpan.startLine,
+              impl.sourceSpan.startCol,
+              impl.sourceSpan.file,
+            );
+          }
+          if (
+            impl.visibility === "PRIVATE" ||
+            impl.visibility === "PROTECTED"
+          ) {
+            this.addError(
+              `Method '${impl.name}' of '${fb.name}' implements INTERFACE '${proto.owner}' and must be PUBLIC or INTERNAL (IEC 61131-3 6.6.6.4.2)`,
+              impl.sourceSpan.startLine,
+              impl.sourceSpan.startCol,
+              impl.sourceSpan.file,
+            );
+          }
+        }
+      }
+    }
+
+    // 6.6.6.2 b: "Interfaces shall not be used as in-out variables." An array
+    // of interface references is an array variable, which the in-out grammar
+    // admits (In_Out_Var_Decl: Array_Var_Decl, Array_Conform_Decl).
+    const checkInOut = (blocks: VarBlock[]): void => {
+      for (const block of blocks) {
+        if (block.blockType !== "VAR_IN_OUT") continue;
+        for (const decl of block.declarations) {
+          if (decl.type.arrayDimensions) continue;
+          if (!ifaces.has(decl.type.name.toUpperCase())) continue;
+          this.addError(
+            `VAR_IN_OUT '${decl.names.join(", ")}' cannot be of interface type '${decl.type.name}': interfaces shall not be used as in-out variables (IEC 61131-3 6.6.6.2); declare it VAR_INPUT`,
+            decl.sourceSpan.startLine,
+            decl.sourceSpan.startCol,
+            decl.sourceSpan.file,
+          );
+        }
+      }
+    };
+    // Annex A: Global_Var_Decl and External_Decl admit no interface type, so
+    // a global holds instances, not references to them.
+    const checkGlobal = (blocks: VarBlock[]): void => {
+      for (const block of blocks) {
+        if (
+          block.blockType !== "VAR_GLOBAL" &&
+          block.blockType !== "VAR_EXTERNAL"
+        ) {
+          continue;
+        }
+        for (const decl of block.declarations) {
+          const element = decl.type.arrayDimensions
+            ? decl.type.elementTypeName
+            : decl.type.name;
+          if (element === undefined || !ifaces.has(element.toUpperCase())) {
+            continue;
+          }
+          this.addError(
+            `${block.blockType} '${decl.names.join(", ")}' cannot be of interface type '${element}': ` +
+              `a global variable holds instances, not interface references (IEC 61131-3 Annex A, Global_Var_Decl)`,
+            decl.sourceSpan.startLine,
+            decl.sourceSpan.startCol,
+            decl.sourceSpan.file,
+          );
+        }
+      }
+    };
+    checkGlobal(ast.globalVarBlocks);
+    for (const config of ast.configurations) checkGlobal(config.varBlocks);
+    for (const pou of [
+      ...ast.programs,
+      ...ast.functions,
+      ...ast.functionBlocks,
+    ]) {
+      checkGlobal(pou.varBlocks);
+    }
+
+    for (const pou of [...ast.programs, ...ast.functions]) {
+      checkInOut(pou.varBlocks);
+    }
+    for (const fb of ast.functionBlocks) {
+      checkInOut(fb.varBlocks);
+      for (const m of fb.methods) checkInOut(m.varBlocks);
+    }
+    for (const iface of ast.interfaces) {
+      for (const m of iface.methods) checkInOut(m.varBlocks);
+    }
+  }
+
+  /**
    * Collect all methods from the parent chain of a function block.
    * Returns a map of uppercase method name → nearest parent MethodDeclaration.
    */
@@ -3077,11 +3496,16 @@ export class SemanticAnalyzer {
    * Validate that abstract function blocks are not instantiated directly.
    */
   private validateAbstractInstantiation(ast: CompilationUnit): void {
-    // Build set of abstract FB names
+    // Build set of abstract FB names: the program's and the libraries'
     const abstractFBs = new Set<string>();
     for (const fb of ast.functionBlocks) {
       if (fb.isAbstract) {
         abstractFBs.add(fb.name.toUpperCase());
+      }
+    }
+    for (const sym of this.symbolTables.globalScope.getAllSymbols()) {
+      if (sym.kind === "functionBlock" && sym.declaration.isAbstract) {
+        abstractFBs.add(sym.name.toUpperCase());
       }
     }
     if (abstractFBs.size === 0) return;
@@ -3110,6 +3534,9 @@ export class SemanticAnalyzer {
     abstractFBs: Set<string>,
   ): void {
     for (const block of varBlocks) {
+      // An abstract type may be the type of an in-out (IEC 61131-3 6.6.5.8.2):
+      // it names the caller's instance of a derived block.
+      if (block.blockType === "VAR_IN_OUT") continue;
       for (const decl of block.declarations) {
         if (abstractFBs.has(decl.type.name.toUpperCase())) {
           this.addError(
@@ -3335,7 +3762,10 @@ export class SemanticAnalyzer {
       if (stmt.kind === "AssignmentStatement") {
         this.validateExpression(stmt.target, varTypeMap, ast);
         this.validateExpression(stmt.value, varTypeMap, ast);
-      } else if (stmt.kind === "RefAssignStatement") {
+      } else if (
+        stmt.kind === "RefAssignStatement" ||
+        stmt.kind === "AssignmentAttemptStatement"
+      ) {
         this.validateExpression(stmt.target, varTypeMap, ast);
         this.validateExpression(stmt.source, varTypeMap, ast);
       } else if (stmt.kind === "FunctionCallStatement") {
@@ -4121,443 +4551,6 @@ export class SemanticAnalyzer {
   // resolveStructFieldType and resolveArrayElementType removed
   // — use resolveFieldType() and resolveArrayElementType() from type-utils.ts
 
-  /**
-   * Validate access modifier enforcement for method calls.
-   * PRIVATE methods only callable from within same FB.
-   * PROTECTED only from same FB or derived FBs.
-   */
-  private validateAccessModifiers(ast: CompilationUnit): void {
-    // Build method visibility map: "FBNAME.METHODNAME" → Visibility
-    const methodVisibility = new Map<string, Visibility>();
-    for (const fb of ast.functionBlocks) {
-      for (const method of fb.methods) {
-        const key = `${fb.name.toUpperCase()}.${method.name.toUpperCase()}`;
-        methodVisibility.set(key, method.visibility);
-      }
-    }
-
-    // Build inheritance chain: FB name → set of ancestor FB names (uppercase)
-    const fbMap = new Map<string, FunctionBlockDeclaration>();
-    for (const fb of ast.functionBlocks) {
-      fbMap.set(fb.name.toUpperCase(), fb);
-    }
-
-    const getAncestors = (fbName: string): Set<string> => {
-      const ancestors = new Set<string>();
-      let current = fbMap.get(fbName.toUpperCase())?.extends;
-      const visited = new Set<string>();
-      while (current) {
-        const upper = current.toUpperCase();
-        if (visited.has(upper)) break;
-        visited.add(upper);
-        ancestors.add(upper);
-        current = fbMap.get(upper)?.extends;
-      }
-      return ancestors;
-    };
-
-    // Check method calls in programs (caller context: not in any FB)
-    for (const prog of ast.programs) {
-      const varTypeMap = this.buildVarTypeMap(prog.varBlocks);
-      this.walkStatementsForAccessViolations(
-        prog.body,
-        varTypeMap,
-        methodVisibility,
-        null,
-        getAncestors,
-      );
-    }
-
-    // Check method calls in functions
-    for (const func of ast.functions) {
-      const varTypeMap = this.buildVarTypeMap(func.varBlocks);
-      this.walkStatementsForAccessViolations(
-        func.body,
-        varTypeMap,
-        methodVisibility,
-        null,
-        getAncestors,
-      );
-    }
-
-    // Check method calls in FBs and their methods
-    for (const fb of ast.functionBlocks) {
-      const varTypeMap = this.buildVarTypeMap(fb.varBlocks);
-      this.walkStatementsForAccessViolations(
-        fb.body,
-        varTypeMap,
-        methodVisibility,
-        fb.name.toUpperCase(),
-        getAncestors,
-      );
-      for (const method of fb.methods) {
-        const methodVarMap = new Map(varTypeMap);
-        for (const [k, v] of this.buildVarTypeMap(method.varBlocks)) {
-          methodVarMap.set(k, v);
-        }
-        this.walkStatementsForAccessViolations(
-          method.body,
-          methodVarMap,
-          methodVisibility,
-          fb.name.toUpperCase(),
-          getAncestors,
-        );
-      }
-    }
-  }
-
-  /**
-   * Walk statements looking for method calls that violate access modifiers.
-   */
-  private walkStatementsForAccessViolations(
-    stmts: Statement[],
-    varTypeMap: Map<string, string>,
-    methodVisibility: Map<string, Visibility>,
-    callerFB: string | null, // uppercase name of the FB we're inside, or null
-    getAncestors: (fbName: string) => Set<string>,
-  ): void {
-    for (const stmt of stmts) {
-      // Check method calls in FunctionCallStatement
-      if (stmt.kind === "FunctionCallStatement") {
-        const fcStmt = stmt as unknown as {
-          call: {
-            kind: string;
-            functionName?: string;
-            object?: Expression;
-            methodName?: string;
-            arguments: Array<{ value: Expression }>;
-            sourceSpan: { startLine: number; startCol: number; file?: string };
-          };
-        };
-        // Handle dotted FunctionCallExpression: m.Method() → functionName = "m.Method"
-        if (
-          fcStmt.call.kind === "FunctionCallExpression" &&
-          fcStmt.call.functionName?.includes(".")
-        ) {
-          this.checkDottedFunctionCallAccess(
-            fcStmt.call.functionName,
-            fcStmt.call.sourceSpan,
-            varTypeMap,
-            methodVisibility,
-            callerFB,
-            getAncestors,
-          );
-        }
-        // Handle MethodCallExpression: chained calls
-        if (fcStmt.call.kind === "MethodCallExpression") {
-          this.checkMethodCallAccess(
-            fcStmt.call as {
-              object: Expression;
-              methodName: string;
-              sourceSpan: {
-                startLine: number;
-                startCol: number;
-                file?: string;
-              };
-            },
-            varTypeMap,
-            methodVisibility,
-            callerFB,
-            getAncestors,
-          );
-        }
-      }
-
-      // Check assignment RHS for method calls
-      if (stmt.kind === "AssignmentStatement") {
-        const value = (stmt as { value: Expression }).value;
-        this.walkExpressionForAccessViolations(
-          value,
-          varTypeMap,
-          methodVisibility,
-          callerFB,
-          getAncestors,
-        );
-      }
-
-      // Recurse into control flow
-      this.recurseStatementsForAccessViolations(
-        stmt,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    }
-  }
-
-  /**
-   * Walk an expression tree looking for method calls that violate access modifiers.
-   */
-  private walkExpressionForAccessViolations(
-    expr: Expression,
-    varTypeMap: Map<string, string>,
-    methodVisibility: Map<string, Visibility>,
-    callerFB: string | null,
-    getAncestors: (fbName: string) => Set<string>,
-  ): void {
-    if (expr.kind === "MethodCallExpression") {
-      this.checkMethodCallAccess(
-        expr as {
-          object: Expression;
-          methodName: string;
-          sourceSpan: { startLine: number; startCol: number; file?: string };
-        },
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-      // Also check arguments
-      const args = (expr as { arguments: Array<{ value: Expression }> })
-        .arguments;
-      for (const arg of args) {
-        this.walkExpressionForAccessViolations(
-          arg.value,
-          varTypeMap,
-          methodVisibility,
-          callerFB,
-          getAncestors,
-        );
-      }
-    } else if (expr.kind === "FunctionCallExpression") {
-      const args = (expr as { arguments: Array<{ value: Expression }> })
-        .arguments;
-      for (const arg of args) {
-        this.walkExpressionForAccessViolations(
-          arg.value,
-          varTypeMap,
-          methodVisibility,
-          callerFB,
-          getAncestors,
-        );
-      }
-    } else if (expr.kind === "BinaryExpression") {
-      const bin = expr as { left: Expression; right: Expression };
-      this.walkExpressionForAccessViolations(
-        bin.left,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-      this.walkExpressionForAccessViolations(
-        bin.right,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    } else if (expr.kind === "UnaryExpression") {
-      const un = expr as { operand: Expression };
-      this.walkExpressionForAccessViolations(
-        un.operand,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    } else if (expr.kind === "ParenthesizedExpression") {
-      const paren = expr as { expression: Expression };
-      this.walkExpressionForAccessViolations(
-        paren.expression,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    }
-  }
-
-  /**
-   * Check a dotted FunctionCallExpression (e.g., functionName="m.InternalCalc")
-   * for access modifier violations.
-   */
-  private checkDottedFunctionCallAccess(
-    functionName: string,
-    sourceSpan: { startLine: number; startCol: number; file?: string },
-    varTypeMap: Map<string, string>,
-    methodVisibility: Map<string, Visibility>,
-    callerFB: string | null,
-    getAncestors: (fbName: string) => Set<string>,
-  ): void {
-    const dotIndex = functionName.indexOf(".");
-    if (dotIndex < 0) return;
-    const objName = functionName.substring(0, dotIndex);
-    const methodName = functionName.substring(dotIndex + 1);
-
-    const calleeFBType = varTypeMap.get(objName.toUpperCase());
-    if (!calleeFBType) return;
-
-    const visKey = `${calleeFBType}.${methodName.toUpperCase()}`;
-    const visibility = methodVisibility.get(visKey);
-    if (!visibility) return;
-
-    if (visibility === "PRIVATE") {
-      if (callerFB !== calleeFBType) {
-        this.addError(
-          `Cannot call PRIVATE method '${methodName}' of '${calleeFBType}' from outside '${calleeFBType}'.`,
-          sourceSpan.startLine,
-          sourceSpan.startCol,
-          sourceSpan.file,
-        );
-      }
-    } else if (visibility === "PROTECTED") {
-      if (callerFB !== calleeFBType) {
-        const ancestors = callerFB ? getAncestors(callerFB) : new Set<string>();
-        if (!ancestors.has(calleeFBType)) {
-          this.addError(
-            `Cannot call PROTECTED method '${methodName}' of '${calleeFBType}' from '${callerFB ?? "PROGRAM"}'.`,
-            sourceSpan.startLine,
-            sourceSpan.startCol,
-            sourceSpan.file,
-          );
-        }
-      }
-    }
-  }
-
-  /**
-   * Check a single method call for access modifier violations.
-   */
-  private checkMethodCallAccess(
-    call: {
-      object: Expression;
-      methodName: string;
-      sourceSpan: { startLine: number; startCol: number; file?: string };
-    },
-    varTypeMap: Map<string, string>,
-    methodVisibility: Map<string, Visibility>,
-    callerFB: string | null,
-    getAncestors: (fbName: string) => Set<string>,
-  ): void {
-    // Only handle obj.Method() where obj is a simple VariableExpression
-    if (call.object.kind !== "VariableExpression") return;
-    const varExpr = call.object as { name: string; fieldAccess: string[] };
-    if (varExpr.fieldAccess.length > 0) return; // skip chained access for now
-
-    const calleeFBType = varTypeMap.get(varExpr.name.toUpperCase());
-    if (!calleeFBType) return;
-
-    const visKey = `${calleeFBType}.${call.methodName.toUpperCase()}`;
-    const visibility = methodVisibility.get(visKey);
-    if (!visibility) return;
-
-    if (visibility === "PRIVATE") {
-      if (callerFB !== calleeFBType) {
-        this.addError(
-          `Cannot call PRIVATE method '${call.methodName}' of '${calleeFBType}' from outside '${calleeFBType}'.`,
-          call.sourceSpan.startLine,
-          call.sourceSpan.startCol,
-          call.sourceSpan.file,
-        );
-      }
-    } else if (visibility === "PROTECTED") {
-      if (callerFB !== calleeFBType) {
-        // Check if caller is a derived FB
-        const ancestors = callerFB ? getAncestors(callerFB) : new Set<string>();
-        if (!ancestors.has(calleeFBType)) {
-          this.addError(
-            `Cannot call PROTECTED method '${call.methodName}' of '${calleeFBType}' from '${callerFB ?? "PROGRAM"}'.`,
-            call.sourceSpan.startLine,
-            call.sourceSpan.startCol,
-            call.sourceSpan.file,
-          );
-        }
-      }
-    }
-  }
-
-  /**
-   * Recurse into control flow statements for access violation checks.
-   */
-  private recurseStatementsForAccessViolations(
-    stmt: Statement,
-    varTypeMap: Map<string, string>,
-    methodVisibility: Map<string, Visibility>,
-    callerFB: string | null,
-    getAncestors: (fbName: string) => Set<string>,
-  ): void {
-    if (stmt.kind === "IfStatement") {
-      const s = stmt as unknown as {
-        thenStatements: Statement[];
-        elsifClauses: Array<{ statements: Statement[] }>;
-        elseStatements: Statement[];
-      };
-      this.walkStatementsForAccessViolations(
-        s.thenStatements,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-      for (const clause of s.elsifClauses) {
-        this.walkStatementsForAccessViolations(
-          clause.statements,
-          varTypeMap,
-          methodVisibility,
-          callerFB,
-          getAncestors,
-        );
-      }
-      this.walkStatementsForAccessViolations(
-        s.elseStatements,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    } else if (stmt.kind === "ForStatement") {
-      const s = stmt as unknown as { body: Statement[] };
-      this.walkStatementsForAccessViolations(
-        s.body,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    } else if (stmt.kind === "WhileStatement") {
-      const s = stmt as unknown as { body: Statement[] };
-      this.walkStatementsForAccessViolations(
-        s.body,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    } else if (stmt.kind === "RepeatStatement") {
-      const s = stmt as unknown as { body: Statement[] };
-      this.walkStatementsForAccessViolations(
-        s.body,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    } else if (stmt.kind === "CaseStatement") {
-      const s = stmt as unknown as {
-        cases: Array<{ statements: Statement[] }>;
-        elseStatements: Statement[];
-      };
-      for (const c of s.cases) {
-        this.walkStatementsForAccessViolations(
-          c.statements,
-          varTypeMap,
-          methodVisibility,
-          callerFB,
-          getAncestors,
-        );
-      }
-      this.walkStatementsForAccessViolations(
-        s.elseStatements,
-        varTypeMap,
-        methodVisibility,
-        callerFB,
-        getAncestors,
-      );
-    }
-  }
-
   // =============================================================================
   // Undefined Type Validation
   // =============================================================================
@@ -4945,6 +4938,7 @@ export class SemanticAnalyzer {
           this.checkExpressionForUndeclaredVars(stmt.value, scope, ctx);
           break;
         case "RefAssignStatement":
+        case "AssignmentAttemptStatement":
           this.checkExpressionForUndeclaredVars(stmt.target, scope, ctx);
           this.checkExpressionForUndeclaredVars(stmt.source, scope, ctx);
           break;
@@ -5595,4 +5589,30 @@ export function analyzeTestFile(
 ): { errors: CompileError[]; warnings: CompileError[] } {
   const analyzer = new SemanticAnalyzer();
   return analyzer.analyzeTestFile(testFile, sourceSymbolTables);
+}
+
+/**
+ * A method's signature (IEC 61131-3 3.87: names, types and order of its
+ * parameters, and its result): `(VAR_INPUT SPEED : REAL, ...) : BOOL`.
+ */
+function methodSignature(method: MethodDeclaration): string {
+  const params: string[] = [];
+  for (const block of method.varBlocks) {
+    if (
+      block.blockType !== "VAR_INPUT" &&
+      block.blockType !== "VAR_OUTPUT" &&
+      block.blockType !== "VAR_IN_OUT"
+    ) {
+      continue;
+    }
+    for (const decl of block.declarations) {
+      for (const name of decl.names) {
+        params.push(
+          `${block.blockType} ${name.toUpperCase()} : ${decl.type.name.toUpperCase()}`,
+        );
+      }
+    }
+  }
+  const result = method.returnType?.name.toUpperCase();
+  return `(${params.join(", ")})${result ? ` : ${result}` : ""}`;
 }

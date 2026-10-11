@@ -203,6 +203,11 @@ export class TypeRegistry {
     if (!deps.includes(decl.type.name)) {
       deps.push(decl.type.name);
     }
+    // A field `ARRAY[..] OF T` needs T declared first, as a field `T` does.
+    const element = decl.type.elementTypeName;
+    if (element !== undefined && !deps.includes(element)) {
+      deps.push(element);
+    }
   }
 
   private collectEnumDependencies(def: EnumDefinition, deps: string[]): void {

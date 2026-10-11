@@ -11,10 +11,14 @@
  *      a member that changes the meaning of its type name within the class
  *      (`-Wchanges-meaning`), so it is emitted as `RUNNINGLIGHTS_`.
  *
- *   2. **The member's name matches an interface method the owning FB
- *      implements.** `VAR Start : BOOL` inside a `FUNCTION_BLOCK ... IMPLEMENTS
- *      IMotor` that declares `METHOD Start` would otherwise redeclare the method
- *      as a data member.
+ *   2. **The member's name matches a method of the owning FB**: its own, one
+ *      it inherits through EXTENDS, or a prototype of any interface it
+ *      implements, inherited ones included (see {@link fbMethodNames}).
+ *      `VAR Start : BOOL` beside `METHOD Start` would otherwise redeclare the
+ *      method as a data member. Source declaring such a pair is refused
+ *      (`semantic/declaration-names`, IEC 61131-3 6.6.5.5.5 rule 2); the rule
+ *      still serves library archives built before that check, whose manifests
+ *      carry the renamed pins as `cppName`.
  *
  * Every emitter that writes or addresses a member has to agree, because they all
  * name the same C++ entity: the class definition (`codegen` / `type-codegen`),
@@ -29,6 +33,9 @@
  */
 
 import type { CompilationUnit } from "../frontend/ast.js";
+import { fbMethodNames } from "../semantic/interface-utils.js";
+
+export { fbMethodNames };
 
 /**
  * Upper-cased names of every user-defined type in a compilation unit — function
@@ -107,4 +114,16 @@ export function mangledMemberName(
   return needsMemberMangling(memberName, memberTypeName, ctx)
     ? `${memberName}_`
     : memberName;
+}
+
+/** {@link fbMethodNames} of every block of the unit that has a method. */
+export function fbMethodNamesByBlock(
+  ast: CompilationUnit,
+): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const fb of ast.functionBlocks) {
+    const names = fbMethodNames(ast, fb.name);
+    if (names.size > 0) out.set(fb.name.toUpperCase(), names);
+  }
+  return out;
 }

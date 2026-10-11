@@ -124,6 +124,18 @@ export interface CompilationUnit extends ASTNode {
   types: TypeDeclaration[];
   configurations: ConfigurationDeclaration[];
   globalVarBlocks: VarBlock[];
+  /**
+   * The interfaces of the libraries the unit is compiled against, as
+   * synthetic declarations (method prototypes only). Consulted wherever an
+   * interface is looked up by name, never emitted: their C++ rides in the
+   * libraries' chunks. See `libraryOopDeclarations`.
+   */
+  libraryInterfaces?: InterfaceDeclaration[];
+  /**
+   * The libraries' function blocks with EXTENDS, IMPLEMENTS or methods, as
+   * synthetic declarations (no variables, no bodies), for the same lookups.
+   */
+  libraryFunctionBlocks?: FunctionBlockDeclaration[];
 }
 
 // =============================================================================
@@ -165,6 +177,12 @@ export interface FunctionBlockDeclaration extends ASTNode {
   methods: MethodDeclaration[];
   properties: PropertyDeclaration[];
   body: Statement[];
+  /**
+   * Library blocks only (`CompilationUnit.libraryFunctionBlocks`): the pins
+   * the library's codegen renamed in C++ (a pin named like a method of the
+   * block), upper-case name → C++ name, from the manifest's `cppName`.
+   */
+  libraryCppNames?: Record<string, string>;
 }
 
 /**
@@ -253,6 +271,11 @@ export interface VarBlock extends ASTNode {
    * can be reported as the contradiction it is.
    */
   isNonRetain: boolean;
+  /**
+   * Access specifier written on the section (`VAR PROTECTED`, IEC 61131-3
+   * §6.6.5.10 / §6.6.7.2.6). Absent when none was written.
+   */
+  access?: Visibility;
   declarations: VarDeclaration[];
 }
 
@@ -300,6 +323,14 @@ export interface VarDeclaration extends ASTNode {
    * only the source holds the user's spelling.
    */
   nameSpans?: SourceSpan[];
+  /**
+   * `R_EDGE` / `F_EDGE` on a BOOL input (IEC 61131-3 Annex A `Edge_Decl`,
+   * §6.6.3.2 item 13): the body sees the output of an implicit R_TRIG / F_TRIG
+   * on the input. Absent on an ordinary declaration.
+   */
+  edge?: "R_EDGE" | "F_EDGE";
+  /** Span of the `R_EDGE` / `F_EDGE` qualifier. */
+  edgeSpan?: SourceSpan;
 }
 
 // =============================================================================
@@ -508,6 +539,7 @@ export interface ProgramInstance extends ASTNode {
 export type Statement =
   | AssignmentStatement
   | RefAssignStatement
+  | AssignmentAttemptStatement
   | IfStatement
   | CaseStatement
   | ForStatement
@@ -535,6 +567,17 @@ export interface AssignmentStatement extends ASTNode {
  */
 export interface RefAssignStatement extends ASTNode {
   kind: "RefAssignStatement";
+  target: Expression;
+  source: Expression;
+}
+
+/**
+ * Assignment attempt `target ?= source;`, IEC 61131-3 6.6.6.7: the target
+ * receives a valid reference when the source's instance implements the
+ * target's interface, else NULL.
+ */
+export interface AssignmentAttemptStatement extends ASTNode {
+  kind: "AssignmentAttemptStatement";
   target: Expression;
   source: Expression;
 }

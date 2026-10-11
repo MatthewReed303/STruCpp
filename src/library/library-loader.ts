@@ -8,7 +8,10 @@
  */
 
 import type {
+  LibraryFBEntry,
+  LibraryInterfaceEntry,
   LibraryManifest,
+  LibraryMethodEntry,
   LibraryTypeEntry,
   LibraryVarType,
   StlibArchive,
@@ -18,14 +21,22 @@ import { DuplicateSymbolError } from "../semantic/symbol-table.js";
 import type {
   ElementaryType,
   EnumType,
+  Expression,
+  FunctionBlockDeclaration,
   IECType,
+  InterfaceDeclaration,
+  MethodDeclaration,
   ReferenceKind,
   StructDefinition,
   StructType,
   TypeReference,
+  VarBlock,
+  VarBlockType,
   VarDeclaration,
 } from "../frontend/ast.js";
 import { createDefaultSourceSpan } from "../frontend/ast.js";
+import { parseInitialValueText } from "../frontend/expression-text.js";
+import { qualifiedEnumValue } from "../frontend/type-defaults.js";
 import { ELEMENTARY_TYPES } from "../semantic/type-utils.js";
 
 /**
@@ -147,6 +158,8 @@ function makeVarSymbol(
     // block, whatever the instance's own qualifier — so the manifest's flag
     // travels onto the symbol rather than being re-derived at the use site.
     isRetain: v.retain === true,
+    // A `NON_RETAIN` member stays out of a RETAIN instance (6.5.6.2).
+    ...(v.nonRetain === true ? { isNonRetain: true } : {}),
     // Only present when the library's codegen mangled the member; the walk
     // prefers it over re-deriving the rule against the wrong unit.
     ...(v.cppName !== undefined ? { cppName: v.cppName } : {}),
@@ -272,6 +285,20 @@ export function loadLibraryManifest(json: unknown): LibraryManifest {
           `Invalid library manifest: types[${i}].members must be an array`,
         );
       }
+      if (
+        t.values !== undefined &&
+        (!Array.isArray(t.values) ||
+          t.values.some((v) => v !== null && typeof v !== "string"))
+      ) {
+        throw new LibraryManifestError(
+          `Invalid library manifest: types[${i}].values must be an array of strings or nulls`,
+        );
+      }
+      if (t.defaultValue !== undefined && typeof t.defaultValue !== "string") {
+        throw new LibraryManifestError(
+          `Invalid library manifest: types[${i}].defaultValue must be a string`,
+        );
+      }
       types.push(t as unknown as LibraryManifest["types"][0]);
     }
   }
@@ -296,6 +323,26 @@ export function loadLibraryManifest(json: unknown): LibraryManifest {
     }
   }
 
+  // Exported interfaces (optional — archives built before interfaces were
+  // exported omit the field).
+  const interfaces: LibraryInterfaceEntry[] = [];
+  if (Array.isArray(obj.interfaces)) {
+    for (let i = 0; i < obj.interfaces.length; i++) {
+      const iface = obj.interfaces[i] as Record<string, unknown>;
+      if (typeof iface.name !== "string" || iface.name.length === 0) {
+        throw new LibraryManifestError(
+          `Invalid library manifest: interfaces[${i}].name must be a non-empty string`,
+        );
+      }
+      if (!Array.isArray(iface.methods)) {
+        throw new LibraryManifestError(
+          `Invalid library manifest: interfaces[${i}].methods must be an array`,
+        );
+      }
+      interfaces.push(iface as unknown as LibraryInterfaceEntry);
+    }
+  }
+
   const result: LibraryManifest = {
     name,
     version,
@@ -306,6 +353,9 @@ export function loadLibraryManifest(json: unknown): LibraryManifest {
     headers: Array.isArray(obj.headers) ? (obj.headers as string[]) : [],
     isBuiltin: Boolean(obj.isBuiltin),
   };
+  if (Array.isArray(obj.interfaces)) {
+    result.interfaces = interfaces;
+  }
 
   if (Array.isArray(obj.globals)) {
     result.globals = globals;
@@ -318,6 +368,156 @@ export function loadLibraryManifest(json: unknown): LibraryManifest {
   }
 
   return result;
+}
+
+/** A synthetic declaration of a library variable, typed as the manifest says. */
+function makeVarDeclaration(v: LibraryVarType): VarDeclaration {
+  return {
+    kind: "VarDeclaration",
+    sourceSpan: createDefaultSourceSpan(),
+    names: [v.name],
+    type: makeSizedTypeRef(v),
+    ...(v.edge !== undefined ? { edge: v.edge } : {}),
+  };
+}
+
+function makeVarBlock(
+  blockType: VarBlockType,
+  vars: readonly LibraryVarType[],
+): VarBlock {
+  return {
+    kind: "VarBlock",
+    sourceSpan: createDefaultSourceSpan(),
+    blockType,
+    isConstant: false,
+    isRetain: false,
+    isNonRetain: false,
+    declarations: vars.map(makeVarDeclaration),
+  } as VarBlock;
+}
+
+/**
+ * The synthetic declaration of a library method: its prototype only, which is
+ * all a consumer type-checks a call against and generates it from. The body
+ * lives in the library's C++ chunk.
+ */
+function makeMethodDeclaration(m: LibraryMethodEntry): MethodDeclaration {
+  const varBlocks: VarBlock[] = [];
+  if (m.inputs.length > 0) varBlocks.push(makeVarBlock("VAR_INPUT", m.inputs));
+  if (m.outputs.length > 0) {
+    varBlocks.push(makeVarBlock("VAR_OUTPUT", m.outputs));
+  }
+  if (m.inouts.length > 0) varBlocks.push(makeVarBlock("VAR_IN_OUT", m.inouts));
+  return {
+    kind: "MethodDeclaration",
+    sourceSpan: createDefaultSourceSpan(),
+    name: m.name,
+    visibility: "PUBLIC",
+    isAbstract: m.isAbstract === true,
+    isFinal: false,
+    isOverride: false,
+    ...(m.returnType !== undefined
+      ? {
+          returnType: {
+            kind: "TypeReference",
+            sourceSpan: createDefaultSourceSpan(),
+            name: m.returnType,
+            isReference: false,
+            referenceKind: "none",
+            ...(typeof m.returnMaxLength === "number"
+              ? { maxLength: m.returnMaxLength }
+              : {}),
+          } as TypeReference,
+        }
+      : {}),
+    varBlocks,
+    body: [],
+  };
+}
+
+/** The synthetic declaration a library interface is known by (6.6.6). */
+export function libraryInterfaceDeclaration(
+  entry: LibraryInterfaceEntry,
+): InterfaceDeclaration {
+  return {
+    kind: "InterfaceDeclaration",
+    sourceSpan: createDefaultSourceSpan(),
+    name: entry.name,
+    ...(entry.extends !== undefined && entry.extends.length > 0
+      ? { extends: [...entry.extends] }
+      : {}),
+    methods: entry.methods.map(makeMethodDeclaration),
+  };
+}
+
+/**
+ * The synthetic declaration a library function block is known by: its
+ * EXTENDS / IMPLEMENTS and its PUBLIC method prototypes. Its pins are not
+ * repeated here — the symbol carries them, inherited ones included.
+ */
+export function libraryFunctionBlockDeclaration(
+  fb: LibraryFBEntry,
+): FunctionBlockDeclaration {
+  const cppNames: Record<string, string> = {};
+  for (const v of [...fb.inputs, ...fb.outputs, ...fb.inouts]) {
+    if (v.cppName !== undefined) cppNames[v.name.toUpperCase()] = v.cppName;
+  }
+  return {
+    kind: "FunctionBlockDeclaration",
+    sourceSpan: createDefaultSourceSpan(),
+    name: fb.name,
+    isAbstract: fb.isAbstract === true,
+    isFinal: fb.isFinal === true,
+    ...(fb.extends !== undefined ? { extends: fb.extends } : {}),
+    ...(fb.implements !== undefined && fb.implements.length > 0
+      ? { implements: [...fb.implements] }
+      : {}),
+    varBlocks: [],
+    methods: (fb.methods ?? []).map(makeMethodDeclaration),
+    properties: [],
+    body: [],
+    ...(Object.keys(cppNames).length > 0 ? { libraryCppNames: cppNames } : {}),
+  };
+}
+
+/**
+ * The interfaces and the function blocks with an OOP surface (EXTENDS,
+ * IMPLEMENTS or methods) of the given libraries, as synthetic declarations.
+ * A consumer compilation keeps them beside its own (CompilationUnit
+ * `libraryInterfaces` / `libraryFunctionBlocks`) so the interface rules of
+ * 6.6.6 — assigning an instance to an interface variable or pin, calling a
+ * method — see the library's types exactly as they see the project's. They
+ * are never emitted: their C++ rides in the library's chunks.
+ */
+export function libraryOopDeclarations(manifests: readonly LibraryManifest[]): {
+  interfaces: InterfaceDeclaration[];
+  functionBlocks: FunctionBlockDeclaration[];
+} {
+  const interfaces: InterfaceDeclaration[] = [];
+  const functionBlocks: FunctionBlockDeclaration[] = [];
+  const seen = new Set<string>();
+  for (const manifest of manifests) {
+    for (const iface of manifest.interfaces ?? []) {
+      const key = iface.name.toUpperCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      interfaces.push(libraryInterfaceDeclaration(iface));
+    }
+    for (const fb of manifest.functionBlocks) {
+      const key = fb.name.toUpperCase();
+      if (seen.has(key)) continue;
+      if (
+        fb.extends === undefined &&
+        (fb.implements ?? []).length === 0 &&
+        (fb.methods ?? []).length === 0
+      ) {
+        continue;
+      }
+      seen.add(key);
+      functionBlocks.push(libraryFunctionBlockDeclaration(fb));
+    }
+  }
+  return { interfaces, functionBlocks };
 }
 
 /**
@@ -418,11 +618,20 @@ export function registerLibrarySymbols(
             definition: {
               kind: "EnumDefinition",
               sourceSpan: createDefaultSourceSpan(),
-              members: (t.members ?? []).map((member) => ({
-                kind: "EnumMember" as const,
-                name: member,
-                sourceSpan: createDefaultSourceSpan(),
-              })),
+              members: (t.members ?? []).map((member, index) => {
+                // The explicit value the library declared (6.4.4.3).
+                const text = t.values?.[index];
+                const value =
+                  typeof text === "string"
+                    ? parseInitialValueText(text)
+                    : undefined;
+                return {
+                  kind: "EnumMember" as const,
+                  name: member,
+                  sourceSpan: createDefaultSourceSpan(),
+                  ...(value !== undefined ? { value } : {}),
+                };
+              }),
               // A data type with named values is debugged at its base's width.
               ...(t.baseType !== undefined
                 ? {
@@ -453,7 +662,7 @@ export function registerLibrarySymbols(
             name: member,
             kind: "enumValue",
             enumType: t.name,
-            value: index,
+            value: explicitEnumValue(t.values?.[index]) ?? index,
             fromLibrary: true,
           });
         });
@@ -515,6 +724,27 @@ export function registerLibrarySymbols(
     }
   }
 
+  // Register interfaces as types, the way the analyzer registers a unit's own
+  // (so they can name a variable's type and an IMPLEMENTS). Their prototypes
+  // reach the interface rules through `libraryOopDeclarations`.
+  for (const iface of manifest.interfaces ?? []) {
+    try {
+      symbolTables.globalScope.define({
+        name: iface.name,
+        kind: "type",
+        declaration:
+          undefined as unknown as import("../frontend/ast.js").TypeDeclaration,
+        resolvedType: {
+          typeKind: "elementary",
+          name: iface.name,
+          sizeBits: 0,
+        } as ElementaryType,
+      });
+    } catch (e) {
+      if (!(e instanceof DuplicateSymbolError)) throw e;
+    }
+  }
+
   // Register function blocks.
   //
   // The interface (inputs/outputs/inouts) is what a consuming compilation
@@ -530,17 +760,7 @@ export function registerLibrarySymbols(
       symbolTables.globalScope.define({
         name: fb.name,
         kind: "functionBlock",
-        declaration: {
-          kind: "FunctionBlockDeclaration",
-          sourceSpan: createDefaultSourceSpan(),
-          name: fb.name,
-          isAbstract: false,
-          isFinal: false,
-          varBlocks: [],
-          methods: [],
-          properties: [],
-          body: [],
-        },
+        declaration: libraryFunctionBlockDeclaration(fb),
         inputs: fb.inputs.map((i) => makeVarSymbol(i, "input")),
         outputs: fb.outputs.map((o) => makeVarSymbol(o, "output")),
         inouts: fb.inouts.map((io) => makeVarSymbol(io, "inout")),
@@ -550,6 +770,7 @@ export function registerLibrarySymbols(
         locals: (fb.locals ?? []).map((l) => makeVarSymbol(l, "local")),
         libraryName: manifest.name,
         ...(fb.inoutsByReference === true ? { inoutsByReference: true } : {}),
+        ...(fb.extends !== undefined ? { libraryExtends: fb.extends } : {}),
       });
     } catch (e) {
       if (!(e instanceof DuplicateSymbolError)) throw e;
@@ -743,3 +964,47 @@ export function loadStlibFromBuffer(
 // bytes themselves and call the pure `loadStlibFromString` /
 // `loadStlibFromBuffer` / `loadStlibArchive` / `loadLibraryManifest`
 // helpers above.
+
+/** An enumerator's explicit value when it is an integer literal. */
+function explicitEnumValue(
+  text: string | null | undefined,
+): number | undefined {
+  if (typeof text !== "string") return undefined;
+  const n = Number(text.replace(/_/g, ""));
+  return Number.isInteger(n) ? n : undefined;
+}
+
+/**
+ * The defaults of the libraries' enumerated types, for a consumer's
+ * declarations of them (`applyTypeDefaults`): the type's own initial value,
+ * else its first member when that has an explicit value (IEC 61131-3
+ * 6.4.4.2.2, 6.4.4.3.2). Qualified (`E#A`), since a library's member names
+ * need not be unique.
+ */
+export function libraryTypeDefaults(
+  manifests: readonly LibraryManifest[],
+): Map<string, Expression> {
+  const out = new Map<string, Expression>();
+  for (const manifest of manifests) {
+    for (const t of manifest.types) {
+      if (t.kind !== "enum") continue;
+      const span = createDefaultSourceSpan();
+      const key = t.name.toUpperCase();
+      if (t.defaultValue !== undefined) {
+        const hash = t.defaultValue.indexOf("#");
+        const member =
+          hash >= 0 ? t.defaultValue.slice(hash + 1) : t.defaultValue;
+        if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(member)) {
+          out.set(key, qualifiedEnumValue(t.name, member, span));
+        } else {
+          // A data type with named values may start from any value (6.4.4.3.2).
+          const value = parseInitialValueText(t.defaultValue);
+          if (value !== undefined) out.set(key, value);
+        }
+      } else if (typeof t.values?.[0] === "string" && t.members?.[0]) {
+        out.set(key, qualifiedEnumValue(t.name, t.members[0], span));
+      }
+    }
+  }
+  return out;
+}

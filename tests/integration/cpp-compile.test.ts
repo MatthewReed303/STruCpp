@@ -840,7 +840,7 @@ int main() {
           count : INT;
         END_VAR
         VAR
-          internal : INT;
+          inner : INT;
         END_VAR
       END_FUNCTION_BLOCK
     `;
@@ -1133,12 +1133,12 @@ int main() {
       FUNCTION_BLOCK ParseFB
         VAR
           dur : STRING;
-          t : TIME; tod : TOD; d : DATE; dt : DT;
+          t : TIME; td : TOD; d : DATE; dtm : DT;
         END_VAR
         t := STRING_TO_TIME(dur);
-        tod := STRING_TO_TOD(dur);
+        td := STRING_TO_TOD(dur);
         d := STRING_TO_DATE(dur);
-        dt := STRING_TO_DT(dur);
+        dtm := STRING_TO_DT(dur);
       END_FUNCTION_BLOCK
     `;
     const result = compile(source);

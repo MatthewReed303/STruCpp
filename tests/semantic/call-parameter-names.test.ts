@@ -216,7 +216,7 @@ describe("inheritance and methods", () => {
   const DERIVED = `
 FUNCTION_BLOCK Dosing EXTENDS Pump
   VAR_INPUT LITRES : REAL; END_VAR
-  METHOD Prime
+  METHOD PUBLIC Prime
     VAR_INPUT SECONDS : INT; END_VAR
   END_METHOD
 END_FUNCTION_BLOCK

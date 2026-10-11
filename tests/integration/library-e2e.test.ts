@@ -307,12 +307,12 @@ END_TEST
                 Count : INT;
               END_VAR
               VAR
-                internal : INT;
+                inner : INT;
               END_VAR
               IF Enable THEN
-                internal := internal + 1;
+                inner := inner + 1;
               END_IF;
-              Count := internal;
+              Count := inner;
             END_FUNCTION_BLOCK
           `,
           fileName: "base_counter.st",

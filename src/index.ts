@@ -36,9 +36,14 @@ import type {
 } from "./frontend/ast.js";
 import { mergeCompilationUnits } from "./merge.js";
 import { lowerInlineTypes } from "./frontend/lower-inline-types.js";
+import { applyTypeDefaults } from "./frontend/type-defaults.js";
 import { walkAST } from "./ast-utils.js";
 import { arrayElementTypeName } from "./semantic/type-utils.js";
-import { registerLibrarySymbols } from "./library/library-loader.js";
+import {
+  libraryOopDeclarations,
+  libraryTypeDefaults,
+  registerLibrarySymbols,
+} from "./library/library-loader.js";
 import type { StlibArchive } from "./library/library-manifest.js";
 import { annotateErrorsWithPouContext } from "./diagnostic-pou-context.js";
 
@@ -524,6 +529,15 @@ function runPipeline(
       mergedOptions,
     };
   }
+  // Type defaults once more, now that inline types are lowered and before the
+  // project model copies the initial values, with the libraries' types: a
+  // variable of a library's enumeration starts from its default as well
+  // (IEC 61131-3 6.4.4.2.2, 6.4.4.3.2). Initialised declarations are untouched.
+  applyTypeDefaults(
+    ast,
+    libraryTypeDefaults((mergedOptions.libraries ?? []).map((a) => a.manifest)),
+  );
+
   try {
     const projectModelResult = buildProjectModel(ast);
     projectModel = projectModelResult.model;
@@ -581,6 +595,16 @@ function runPipeline(
   // Phase 4: Library loading.  Archives arrive pre-loaded;
   // fs-based discovery lives in `strucpp/node`.
   allArchives.push(...(mergedOptions.libraries ?? []));
+
+  // The libraries' interfaces and OOP blocks, beside the unit's own, for the
+  // interface rules (IEC 61131-3 6.6.6) — never emitted, see the loader.
+  if (ast && allArchives.length > 0) {
+    const oop = libraryOopDeclarations(allArchives.map((a) => a.manifest));
+    if (oop.interfaces.length > 0) ast.libraryInterfaces = oop.interfaces;
+    if (oop.functionBlocks.length > 0) {
+      ast.libraryFunctionBlocks = oop.functionBlocks;
+    }
+  }
 
   if (!continueOnError && errors.length > 0) {
     return {

@@ -10,7 +10,7 @@ FUNCTION_BLOCK Robot IMPLEMENTS IMovable
     posY : INT;
   END_VAR
 
-  METHOD MoveTo : BOOL
+  METHOD PUBLIC MoveTo : BOOL
     VAR_INPUT x : INT; y : INT; END_VAR
     posX := x;
     posY := y;

@@ -235,3 +235,61 @@ describe("structure initializer placement — accepted in declarations", () => {
     `);
   });
 });
+
+describe("a structure initializer names elements the structure has (6.4.4.6.2)", () => {
+  const RATE = `
+TYPE
+  RATE_UNIT : (PER_SEC, PER_MIN);
+  RATE_SET : STRUCT unit : RATE_UNIT; scale : REAL := 1.0; END_STRUCT;
+  RATE_DATA : STRUCT set : RATE_SET; rate : REAL; END_STRUCT;
+  RATE_ALIAS : RATE_DATA;
+END_TYPE
+`;
+  const prog = (vars: string) => `${RATE}
+PROGRAM Main
+  VAR ${vars} END_VAR
+  ;
+END_PROGRAM`;
+
+  it("reports an element of a nested structure named at the outer level, with its position", () => {
+    const r = compile(prog("d : RATE_DATA := (unit := PER_MIN);"));
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]!.message).toMatch(/Structure 'RATE_DATA' has no element 'UNIT'.*SET, RATE/);
+    expect(r.errors[0]!.line).toBe(10);
+  });
+
+  it("follows nested initializers, arrays and aliases", () => {
+    expect(errorsFor(prog("d : RATE_DATA := (set := (units := PER_MIN));"))[0]).toMatch(
+      /Structure 'RATE_SET' has no element 'UNITS'/,
+    );
+    expect(errorsFor(prog("a : ARRAY[1..2] OF RATE_DATA := [(rate := 1.0), (rat := 2.0)];"))[0]).toMatch(
+      /has no element 'RAT'/,
+    );
+    expect(errorsFor(prog("d : RATE_ALIAS := (sett := (unit := PER_MIN));"))[0]).toMatch(
+      /has no element 'SETT'/,
+    );
+  });
+
+  it("accepts the correct nesting", () => {
+    expectClean(prog("d : RATE_DATA := (set := (unit := PER_MIN, scale := 2.0), rate := 3.0);"));
+    expectClean(prog("a : ARRAY[1..2] OF RATE_DATA := [(rate := 1.0), (set := (unit := PER_SEC))];"));
+  });
+});
+
+describe("one name, one data type (6.4.4.1.1, 6.9.1)", () => {
+  it("refuses a TYPE declared twice, in one file or across files", () => {
+    const one = compile(`TYPE T1 : STRUCT a : INT; END_STRUCT; END_TYPE
+TYPE T1 : STRUCT b : INT; END_STRUCT; END_TYPE
+PROGRAM Main VAR x : T1; END_VAR ; END_PROGRAM`);
+    expect(one.errors.map((e) => e.message).join("\n")).toMatch(
+      /Data type 'T1' is already declared/,
+    );
+    expect(one.errors[0]!.line).toBe(2);
+    const two = compile(`TYPE T1 : INT; END_TYPE
+PROGRAM Main VAR x : T1; END_VAR ; END_PROGRAM`, {
+      additionalSources: [{ fileName: "b.st", source: "TYPE t1 : DINT; END_TYPE" }],
+    });
+    const dup = two.errors.find((e) => /already declared/.test(e.message))!;
+    expect(dup.file).toBe("b.st");
+  });
+});

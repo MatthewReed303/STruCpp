@@ -27,6 +27,9 @@ import * as os from "os";
 import { execFileSync, execSync } from "child_process";
 import { compile } from "../../src/index.js";
 import { hasGpp, CXX_STD } from "./test-helpers.js";
+import { compileStlib } from "../../src/library/library-compiler.js";
+import { loadStlibFromString } from "../../src/library/library-loader.js";
+import type { StlibArchive } from "../../src/library/library-manifest.js";
 
 const RUNTIME_INCLUDE = path.resolve(__dirname, "../../src/runtime/include");
 const describeIfGpp = hasGpp ? describe : describe.skip;
@@ -119,8 +122,11 @@ type Built = { bin: string; leaves: Map<string, Leaf>; retained: Leaf[]; map: an
 let tempDir: string;
 let pch = 0;
 
-function build(name: string, st: string): Built {
-  const result = compile(st, { headerFileName: "generated.hpp" });
+function build(name: string, st: string, libraries?: StlibArchive[]): Built {
+  const result = compile(st, {
+    headerFileName: "generated.hpp",
+    ...(libraries ? { libraries } : {}),
+  });
   expect(result.errors.map((e) => e.message)).toEqual([]);
   const dir = path.join(tempDir, name);
   fs.mkdirSync(dir, { recursive: true });
@@ -492,6 +498,168 @@ VAR RETAIN hours : INT := 3; starts : LINT; END_VAR`,
     const { report, values } = loadInto(p, blob);
     expect(report).toMatchObject({ result: MIGRATED, kept: 12, added: 1, dropped: 1 });
     expect(values["CFG.MODE"]).toBe(0);
+  });
+
+  describe("an enumeration whose members were only appended keeps its values (decision 26)", () => {
+    // IEC 61131-3 6.4.4.2 / 6.4.4.3: a value of an enumerated (or named-value)
+    // type is one of its listed members. Appending members leaves every stored
+    // member in place with its value, so an upload (a warm restart, 6.5.6.1
+    // rule 1) keeps it; any other change drops it (6.5.6.2: initial value).
+    const enumProgram = (types: string) => `TYPE
+  ${types}
+END_TYPE
+PROGRAM Main
+VAR RETAIN plain : E1; small : E2; named : E3; many : ARRAY[1..3] OF E2; END_VAR
+  plain := plain;
+END_PROGRAM
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK task0(INTERVAL := T#20ms, PRIORITY := 0);
+    PROGRAM instance0 WITH task0 : Main;
+  END_RESOURCE
+END_CONFIGURATION`;
+    const ENUM_VALUES = {
+      "INSTANCE0.PLAIN": 2,
+      "INSTANCE0.SMALL": 2,
+      "INSTANCE0.NAMED": 20,
+      "INSTANCE0.MANY[1]": 1,
+      "INSTANCE0.MANY[2]": 2,
+      "INSTANCE0.MANY[3]": 0,
+    };
+    let saved: string;
+    beforeAll(() => {
+      const p = build("enum-base", enumProgram(`E1 : (A1, B1, C1);
+  E2 : USINT (A2, B2, C2);
+  E3 : UINT (X3 := 10, Y3 := 20);`));
+      saved = path.join(tempDir, "enum-base.v2");
+      saveFrom(p, ENUM_VALUES, saved);
+    }, 120_000);
+
+    it("plain, USINT-based and UINT named-value enumerations, members appended: every value kept", () => {
+      const p = build("enum-append", enumProgram(`E1 : (A1, B1, C1, D1);
+  E2 : USINT (A2, B2, C2, D2, E2X);
+  E3 : UINT (X3 := 10, Y3 := 20, Z3 := 30);`));
+      const { report, values } = loadInto(p, saved);
+      expect(report).toMatchObject({ result: MIGRATED, kept: 6, added: 0, dropped: 0, refused: 0 });
+      for (const [k, v] of Object.entries(ENUM_VALUES)) expect(values[k]).toEqual(v);
+    });
+
+    it("unchanged enumerations: Ok", () => {
+      const p = build("enum-same", enumProgram(`E1 : (A1, B1, C1);
+  E2 : USINT (A2, B2, C2);
+  E3 : UINT (X3 := 10, Y3 := 20);`));
+      expect(loadInto(p, saved).report).toMatchObject({ result: OK, kept: 6 });
+    });
+
+    it("reorder, rename, removal or a changed value: dropped, initial value", () => {
+      const p = build("enum-other", enumProgram(`E1 : (B1, A1, C1, D1);
+  E2 : USINT (A2, B2, CC2) := B2;
+  E3 : UINT (X3 := 10) := X3;`));
+      const { report, values } = loadInto(p, saved);
+      expect(report).toMatchObject({ result: MIGRATED, kept: 0, added: 6, dropped: 6 });
+      expect(values["INSTANCE0.PLAIN"]).toBe(0);
+      expect(values["INSTANCE0.SMALL"]).toBe(1);
+      expect(values["INSTANCE0.NAMED"]).toBe(10);
+      const v = build("enum-value", enumProgram(`E1 : (A1, B1, C1);
+  E2 : USINT (A2, B2, C2);
+  E3 : UINT (X3 := 10, Y3 := 21, Z3 := 30) := X3;`));
+      const r = loadInto(v, saved);
+      expect(r.report).toMatchObject({ result: MIGRATED, kept: 5, added: 1, dropped: 1 });
+      expect(r.values["INSTANCE0.NAMED"]).toBe(10);
+    });
+
+    it("an enumeration that lost its last members is not a start of the stored one: dropped", () => {
+      const p = build("enum-shorter", enumProgram(`E1 : (A1, B1);
+  E2 : USINT (A2, B2, C2);
+  E3 : UINT (X3 := 10, Y3 := 20);`));
+      const { report, values } = loadInto(p, saved);
+      expect(report).toMatchObject({ result: MIGRATED, kept: 5, added: 1, dropped: 1 });
+      expect(values["INSTANCE0.PLAIN"]).toBe(0);
+    });
+  });
+
+  describe("library blocks in a RETAIN array: resize, enumeration growth, NON_RETAIN", () => {
+    // T12: a retained element is named by its own subscript and member, so a
+    // resized array keeps every element whose subscript still exists; new ones
+    // start from their initial values (6.5.6.2), removed ones are dropped.
+    const lib = (members: string): StlibArchive => {
+      const r = compileStlib(
+        [
+          {
+            fileName: "lt.st",
+            source: `TYPE LT_MODE : USINT (${members}) := LT_OFF; END_TYPE
+FUNCTION_BLOCK LT_ZONE
+VAR_INPUT NON_RETAIN Cmd : INT; END_VAR
+VAR_INPUT Sp : REAL := 1.5; END_VAR
+VAR Mode : LT_MODE; Runs : DINT; Hist : ARRAY[1..2] OF INT; END_VAR
+VAR NON_RETAIN Scratch : INT; END_VAR
+Runs := Runs + 1;
+END_FUNCTION_BLOCK
+`,
+          },
+        ],
+        { name: "lt-lib", version: "1.0.0", namespace: "lt" },
+      );
+      expect(r.errors).toEqual([]);
+      return loadStlibFromString(JSON.stringify(r.archive));
+    };
+    const zones = (range: string) => `PROGRAM Main
+VAR RETAIN z : ARRAY[${range}] OF LT_ZONE; END_VAR
+  z[1](Sp := z[1].Sp);
+END_PROGRAM
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK task0(INTERVAL := T#20ms, PRIORITY := 0);
+    PROGRAM instance0 WITH task0 : Main;
+  END_RESOURCE
+END_CONFIGURATION`;
+    const ZONE_VALUES: Record<string, number> = {};
+    for (const n of [1, 2, 3, 4]) {
+      ZONE_VALUES[`INSTANCE0.Z[${n}].SP`] = 10 + n;
+      ZONE_VALUES[`INSTANCE0.Z[${n}].MODE`] = 1;
+      ZONE_VALUES[`INSTANCE0.Z[${n}].RUNS`] = 100 * n;
+      ZONE_VALUES[`INSTANCE0.Z[${n}].HIST[2]`] = n;
+    }
+    let base: Built;
+    let saved: string;
+    beforeAll(() => {
+      base = build("zones-4", zones("1..4"), [lib("LT_OFF, LT_AUTO")]);
+      saved = path.join(tempDir, "zones-4.v2");
+      saveFrom(base, ZONE_VALUES, saved);
+    }, 120_000);
+
+    it("a block's NON_RETAIN members stay out of a RETAIN instance (6.5.6.2)", () => {
+      const paths = base.retained.map((l) => l.path);
+      expect(paths).toContain("INSTANCE0.Z[1].SP");
+      expect(paths).toContain("INSTANCE0.Z[1].RUNS");
+      expect(paths.filter((p) => /SCRATCH|CMD/.test(p))).toEqual([]);
+      // 4 zones x (Sp, Mode, Runs, Hist[1], Hist[2])
+      expect(paths.length).toBe(20);
+    });
+
+    it("[1..4] -> [1..5]: the four zones kept, the fifth at its initial values", () => {
+      const p = build("zones-5", zones("1..5"), [lib("LT_OFF, LT_AUTO")]);
+      const { report, values } = loadInto(p, saved);
+      expect(report).toMatchObject({ result: MIGRATED, kept: 20, added: 5, dropped: 0 });
+      for (const [k, v] of Object.entries(ZONE_VALUES)) expect(values[k]).toEqual(v);
+      expect(values["INSTANCE0.Z[5].SP"]).toBe(1.5);
+      expect(values["INSTANCE0.Z[5].RUNS"]).toBe(0);
+    });
+
+    it("[1..4] -> [1..3]: three zones kept, the fourth dropped", () => {
+      const p = build("zones-3", zones("1..3"), [lib("LT_OFF, LT_AUTO")]);
+      const { report, values } = loadInto(p, saved);
+      expect(report).toMatchObject({ result: MIGRATED, kept: 15, added: 0, dropped: 5 });
+      expect(values["INSTANCE0.Z[3].RUNS"]).toBe(300);
+      expect(values["INSTANCE0.Z[3].MODE"]).toBe(1);
+    });
+
+    it("a resize together with a library enumeration that gained a member: all kept", () => {
+      const p = build("zones-5-hand", zones("1..5"), [lib("LT_OFF, LT_AUTO, LT_HAND")]);
+      const { report, values } = loadInto(p, saved);
+      expect(report).toMatchObject({ result: MIGRATED, kept: 20, added: 5, dropped: 0 });
+      for (const n of [1, 2, 3, 4]) expect(values[`INSTANCE0.Z[${n}].MODE`]).toBe(1);
+    });
   });
 
   describe("safety: a damaged blob writes nothing", () => {

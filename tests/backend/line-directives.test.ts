@@ -290,7 +290,7 @@ FUNCTION_BLOCK Robot IMPLEMENTS IMovable
     position : INT;
   END_VAR
 
-  METHOD Move : BOOL
+  METHOD PUBLIC Move : BOOL
     VAR_INPUT
       distance : INT;
     END_VAR

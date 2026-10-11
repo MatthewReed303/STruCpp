@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import { compile } from '../../src/index.js';
 import { generateReplMain } from '../../src/backend/repl-main-gen.js';
+import { discoverStlibs } from '../../src/node/library-loader.js';
 
 describe('Phase 3.6 - REPL Main Generator', () => {
   describe('Standalone Programs (no CONFIGURATION)', () => {
@@ -605,18 +606,17 @@ END_PROGRAM`);
     expect(mainCpp).toContain('&prog_MAIN.RIG_}');
   });
 
-  it('leaves a variable named after an elementary type alone', () => {
-    // `Time : TIME` is an ordinary declaration; codegen emits plain `TIME`, so
-    // mangling here would address a member that does not exist.
-    const mainCpp = mainFor(`
+  it('never meets a variable named after an elementary type: it is refused', () => {
+    // `Time : TIME` uses a keyword as a name (IEC 61131-3 6.1.3, Table 10).
+    const result = compile(`
 PROGRAM Main
 VAR Time : TIME; Word : WORD; counter : INT; END_VAR
   counter := counter + 1;
 END_PROGRAM`);
-    expect(mainCpp).toContain('{"TIME", VarTypeTag::TIME, &prog_MAIN.TIME}');
-    expect(mainCpp).toContain('{"WORD", VarTypeTag::WORD, &prog_MAIN.WORD}');
-    expect(mainCpp).not.toContain('TIME_');
-    expect(mainCpp).not.toContain('WORD_');
+    expect(result.success).toBe(false);
+    expect(result.errors.map((e) => e.message).join('\n')).toMatch(
+      /'Time' is a keyword[\s\S]*'Word' is a keyword/,
+    );
   });
 
   it('applies to program instances under a CONFIGURATION too', () => {
@@ -632,5 +632,28 @@ CONFIGURATION Config0
   END_RESOURCE
 END_CONFIGURATION`);
     expect(mainCpp).toContain('&config_CONFIG0.INSTANCE0.MOTOR_}');
+  });
+
+  it('mangles an instance named like a library block type (`ton : TON`)', () => {
+    // IEC 61131-3 forbids no instance named like its block type (6.6.3.2
+    // item 18 only advises against a function's name), and codegen emits it
+    // as `TON_`. The harness knew only the unit's own types, so it addressed
+    // `TON`, which is no member.
+    const result = compile(
+      `PROGRAM Main
+VAR ton : TON; ctu : CTU; plain : TON; END_VAR
+  ton(IN := TRUE, PT := T#1s);
+END_PROGRAM`,
+      { libraries: discoverStlibs('libs') },
+    );
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    expect(result.headerCode).toMatch(/\bTON TON_;/);
+    const mainCpp = generateReplMain(result.ast!, result.projectModel!, {
+      headerFileName: 'generated.hpp',
+      ...(result.symbolTables ? { symbolTables: result.symbolTables } : {}),
+    });
+    expect(mainCpp).toContain('&prog_MAIN.TON_}');
+    expect(mainCpp).toContain('&prog_MAIN.CTU_}');
+    expect(mainCpp).toContain('&prog_MAIN.PLAIN}');
   });
 });

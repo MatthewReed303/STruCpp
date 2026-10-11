@@ -35,7 +35,7 @@ describe("Undefined Type Validation - Positive (no false errors)", () => {
           s : STRING;
           w : WORD;
           t : TIME;
-          dt : DATE;
+          dat : DATE;
         END_VAR
       END_PROGRAM
     `);

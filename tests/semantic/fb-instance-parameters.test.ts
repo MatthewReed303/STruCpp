@@ -332,7 +332,7 @@ describe("resolving the parameter's type", () => {
     const result = build(`
       FUNCTION_BLOCK Engine
         VAR_INPUT SPEED : INT; END_VAR
-        METHOD Go : INT  Go := SPEED; END_METHOD
+        METHOD PUBLIC Go : INT  Go := SPEED; END_METHOD
         SPEED := SPEED;
       END_FUNCTION_BLOCK
       FUNCTION_BLOCK Driver

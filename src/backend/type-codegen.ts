@@ -68,6 +68,14 @@ export interface TypeCodeGenOptions {
   externalStructs?: readonly import("./type-descriptor-gen.js").ExternalStruct[];
   /** Enumerated types a library declares, which a struct here may hold. */
   externalEnums?: readonly string[];
+  /** The compilation's bare-enumerator lookup (member name, upper case → owning
+   *  enumeration): a linked library's enumerations and every one of the
+   *  project's, not only those in the types emitted here. `CodeGenerator`
+   *  passes the map its own expressions qualify by, so an element default
+   *  (`mode := LM_AUTO`) names `LibMode::LM_AUTO` exactly as a variable
+   *  initialiser does. Standalone use falls back to the enumerations among
+   *  the types given. */
+  enumMembers?: ReadonlyMap<string, EnumMemberEntry>;
 }
 
 /**
@@ -212,7 +220,7 @@ export class TypeCodeGenerator {
     reason: string;
   }> = [];
   /** Reverse map: enum member name (upper case) → owning enum type */
-  private enumMemberToType: Map<string, EnumMemberEntry> = new Map();
+  private enumMemberToType: ReadonlyMap<string, EnumMemberEntry> = new Map();
   /** Set while an enumeration's member values are emitted: its own members
    *  (upper case), named bare inside the enum body, where the type's name is
    *  not yet declared. Their arithmetic is integer, so AND/OR/XOR are bitwise. */
@@ -272,21 +280,26 @@ export class TypeCodeGenerator {
       indent: this.options.indent,
     });
 
-    // Build reverse map for bare enum member qualification
-    this.enumMemberToType = buildEnumMemberMap(
-      types
-        .filter(
-          (t) =>
-            t.definition.kind === "EnumDefinition" &&
-            t.inline?.owner === undefined,
-        )
-        .map((t) => ({
-          name: t.name,
-          members: (
-            t.definition as import("../frontend/ast.js").EnumDefinition
-          ).members.map((m) => m.name),
-        })),
-    );
+    // Reverse map for bare enum member qualification. Built from these types
+    // alone it misses a library's enumerations (and a project enumeration
+    // emitted in an earlier batch), whose members then came out bare — and a
+    // typed enumeration's members are not in scope bare (`X__NAMED`).
+    this.enumMemberToType =
+      this.options.enumMembers ??
+      buildEnumMemberMap(
+        types
+          .filter(
+            (t) =>
+              t.definition.kind === "EnumDefinition" &&
+              t.inline?.owner === undefined,
+          )
+          .map((t) => ({
+            name: t.name,
+            members: (
+              t.definition as import("../frontend/ast.js").EnumDefinition
+            ).members.map((m) => m.name),
+          })),
+      );
 
     if (types.length === 0) {
       return "";

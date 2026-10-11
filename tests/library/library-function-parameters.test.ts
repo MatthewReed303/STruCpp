@@ -137,3 +137,35 @@ int main() {
     });
   },
 );
+
+describe("library FUNCTION called with every input omitted", () => {
+  const DEF = `
+FUNCTION LEFT_TIME : TIME
+  VAR_INPUT PT : TIME := T#0s; ET : TIME := T#0s; END_VAR
+  LEFT_TIME := PT - ET;
+END_FUNCTION
+`;
+  const lib = (): StlibArchive => {
+    const l = compileStlib([{ source: DEF, fileName: "def.st" }], {
+      name: "def-lib",
+      version: "1.0.0",
+      namespace: "deflib",
+    });
+    expect(l.errors).toEqual([]);
+    return loadStlibFromString(JSON.stringify(l.archive));
+  };
+
+  it("passes the declared initial values for an empty call (6.6.1.4.2)", () => {
+    const result = compile(
+      `PROGRAM Main
+  VAR a : TIME; b : TIME; END_VAR
+  a := LEFT_TIME();
+  b := LEFT_TIME(PT := T#5s);
+END_PROGRAM`,
+      { headerFileName: "generated.hpp", libraries: [lib()] },
+    );
+    expect(result.errors.map((e) => e.message)).toEqual([]);
+    expect(result.cppCode).toMatch(/A = LEFT_TIME\(0LL, 0LL\);/);
+    expect(result.cppCode).toMatch(/B = LEFT_TIME\(5000000000LL, 0LL\);/);
+  });
+});
